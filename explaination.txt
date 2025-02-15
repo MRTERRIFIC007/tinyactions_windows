@@ -1,0 +1,207 @@
+
+
+ Project Flow Overview
+
+1. Training Pipeline 
+   - Entry Point:
+     The training starts in **`train.py`**. This file sets up the training process by:
+     - **Device Selection:** It checks for Metal (MPS) support (or falls back to CPU).
+     - **Data Preparation:**  
+       It calls functions from **`Preprocessing.py`** (which, in turn, uses configuration settings from **`config.py`**) to obtain lists of sample IDs, labels, and file paths. The training data are loaded using the dataset defined in **`my_dataloader.py`**.
+     - **Model Initialization:**  
+       The model is instantiated as `VideoSWIN3D` from **`Model/VideoSWIN.py`** (a 3D Swin Transformer tailored for video data).  
+       Inside this file, the model is built by creating a patch-embedding module, a backbone (the Swin Transformer in 3D), and a classification head (implemented as `SwinTransformer3D_head`, defined within the same file).
+     - Optimization:**  
+       The training loop uses the ASAM optimizer from **`asam.py`** that performs a two-step update (ascent and descent) for better generalization.
+     - **Training & Checkpointing:**  
+       During each epoch, losses and accuracies are computed and the best-performing model is saved. Training metrics are visualized using **`utils/visualize.py`**.
+  
+2. **Evaluation Pipeline**  
+   - **Entry Point:**  
+     Evaluation is handled in **`gen_eval.py`**. Here:
+     - The evaluation configuration is built using the function in **`configuration.py`** (note that this is a separate configuration file from **`config.py`** used in training).
+     - A test dataset is prepared using the dataset class in **`dataloader2.py`** (an alternative to the one used in training).
+     - The previously trained `VideoSWIN3D` model (loaded from a checkpoint) is run on the test data.
+     - Predictions are processed (using a sigmoid activation and a threshold) and written out to a text file.
+  
+3. **Model Components**  
+   - **`Model/VideoSWIN.py`**  
+     Contains the full definition of the `VideoSWIN3D` model. It builds its backbone by stacking several Swin Transformer 3D layers (with window-based self-attention) and adds a classification head.
+   - **Additional Model Files:**  
+     - **`Model/cls_head.py`** defines an alternative classification head (named `vidswin_head`). However, this head is not integrated into the currently used model pipeline since `VideoSWIN3D` uses its internally defined head.
+     - **`Model/ViViT_FE.py`** (and its helper **`Model/model_utils.py`**) offer an alternative (ViViT-based) model architecture; these are not used in the current workflow because training and evaluation exclusively rely on `VideoSWIN3D`.
+
+4. **Utility and Test Files**  
+   - **Utilities:**  
+     - **`utils/visualize.py`** is used to generate training plots.
+     - **`utils/countframes.py`** is a standalone script to count frames in video files and plot their distribution. It is not part of training or evaluation.
+   - **Test Script:**  
+     - **`test.py`** is a simple script to load video frames and print their shape. It serves for quick testing and is not integrated into the main training/evaluation pipelines.
+
+---
+
+## Which Files Are Actively Used (Defining the Flow)
+
+- **`train.py`**  
+  Main training script.
+- **`my_dataloader.py`**  
+  Defines the active dataset class (`TinyVIRAT_dataset`) used in training.
+- **`Preprocessing.py`**  
+  Provides data partitioning and label encoding functions for training.
+- **`asam.py`**  
+  Implements the ASAM optimizer used during training.
+- **`config.py`**  
+  Supplies video parameters, file paths, and constants used in training.
+- **`Model/VideoSWIN.py`**  
+  Defines the `VideoSWIN3D` model which is the backbone of the training architecture.
+- **`utils/visualize.py`**  
+  Generates and saves plots for training metrics.
+- **`gen_eval.py`**  
+  Implements the evaluation pipeline using the trained `VideoSWIN3D` model.
+- **`configuration.py`**  
+  Used by `gen_eval.py` to build a config for the evaluation pipeline.
+- **`dataloader2.py`**  
+  Provides the dataset implementation used in evaluation (via `gen_eval.py`).
+
+---
+
+## Which Files Are Currently Being Ignored
+
+- **`dataloader.py`**  
+  Contains an alternative dataset class (`TinyVirat`) that is not referenced by either the training (`train.py`) or evaluation (`gen_eval.py`) scripts.
+- **`Model/ViViT_FE.py`** and **`Model/model_utils.py`**  
+  Define an alternative (ViViT-based) model and supporting utilities; they are not used because the project opts for `VideoSWIN3D` in **`Model/VideoSWIN.py`**.
+- **`Model/cls_head.py`**  
+  Defines an alternative classification head for VideoSWIN. Since `VideoSWIN3D` uses its internal head (i.e., `SwinTransformer3D_head`), this file is not utilized.
+- **`utils/countframes.py`**  
+  A standalone utility script for frame counting; it is not part of the main training or evaluation flows.
+- **`test.py`**  
+  A simple script to test video frame loading. It serves only for ad hoc testing and is not integrated into the normal pipeline.
+
+---
+
+## Summary
+
+- **Active Files (Defining the Flow):**
+  - `train.py`
+  - `my_dataloader.py`
+  - `Preprocessing.py`
+  - `asam.py`
+  - `config.py`
+  - `Model/VideoSWIN.py`
+  - `utils/visualize.py`
+  - `gen_eval.py`
+  - `configuration.py`
+  - `dataloader2.py`
+
+- **Ignored Files (Not Used in the Current Setup):**
+  - `dataloader.py`
+  - `Model/ViViT_FE.py`
+  - `Model/model_utils.py`
+  - `Model/cls_head.py`
+  - `utils/countframes.py`
+  - `test.py`
+
+In the current state, the project's training and evaluation pipelines revolve around `train.py` and `gen_eval.py` (with supporting modules), while the alternative dataset implementations, alternative model architectures/heads, and standalone utility/test scripts are not used.
+
+
+
+Changes: 
+Below is a recommendation on which files (and which parts of them) you’ll need to modify in order to:
+
+1. **Reduce the number of frames loaded (physical data size)**
+2. **Convert the frames to grayscale (black‑and‑white) to lower the input channel count and model load**
+
+### Files to Change
+
+1. **`config.py`**  
+   - **Why?**  
+     The number of frames used per video is set via the configuration (using the key `video_params['num_frames']`). Reducing this value will make each sample smaller and lessen GPU usage.
+   - **What to Change?**  
+     Lower the value of `"num_frames"` (and possibly adjust `"height"`/`"width"` if you also want to reduce spatial resolution).
+
+2. **`my_dataloader.py`**  
+   - **Why?**  
+     This file defines the dataset class (`TinyVIRAT_dataset`) that loads and processes the video frames.  
+     To make the frames black and white (grayscale) you will need to modify the frame-loading and/or transformation parts:
+     - Change the conversion code in `load_all_frames` (which currently uses `cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)`) to instead convert frames to grayscale (e.g. using `cv2.COLOR_BGR2GRAY`).
+     - **IMPORTANT:** Because converting to grayscale yields a single-channel image rather than three channels, you must update the transformation step (in the function `to_normalized_float_tensor` or by adding a custom transform) so that it can handle the new data shape. For example, you might insert a check to see if the input has 2 dimensions per frame and then add an extra channel dimension.
+
+### Example Modifications
+
+Below are some sample code changes you can apply.
+
+---
+
+#### 1. Modify `config.py`
+
+Locate the part where the video parameters are defined; for example, change from:
+
+```python
+video_params = {
+    "width" : 120,
+    "height" : 120,
+    "num_frames" : 60
+}
+```
+
+to (e.g., reduce number of frames to 16):
+
+```python
+video_params = {
+    "width" : 120,
+    "height" : 120,
+    "num_frames" : 16   # Reduced number of frames
+}
+```
+
+---
+
+#### 2. Modify `my_dataloader.py`
+
+**a. Change the frame conversion to grayscale**  
+In the function `load_all_frames`, change the conversion line from RGB to grayscale. For example, find:
+
+```python
+frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+```
+
+and change it to:
+
+```python
+frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+```
+
+This will produce 2D arrays for each frame.
+
+**b. Update the tensor conversion transform**  
+The function `to_normalized_float_tensor` in your file currently looks like this:
+
+```python
+def to_normalized_float_tensor(vid):
+    return vid.permute(3, 0, 1, 2).to(torch.float32) / 255
+```
+
+Since a grayscale image does not have the 4th dimension (the channel is missing), you can modify it to handle both cases. For example:
+
+```python:train.py
+def to_normalized_float_tensor(vid):
+    # If the video frames are grayscale (T, H, W) add a channel axis at the end
+    if vid.ndim == 3:  # (T, H, W)
+        vid = vid.unsqueeze(-1)  # Now (T, H, W, 1)
+    return vid.permute(3, 0, 1, 2).to(torch.float32) / 255
+```
+
+**c. (Optional) Insert a custom transform to convert to grayscale**  
+Alternatively, if you prefer to keep your `load_all_frames` unchanged, you could add a new transformation in the `transforms.Compose` chain in the dataset’s `__init__` that converts the video to grayscale. But given that you want to physically load less data, it’s often better to convert during frame read (i.e. in `load_all_frames`).
+
+---
+
+### Summary
+
+- **Change in `config.py`:** Lower `num_frames` (and adjust resolution if needed) to reduce the volume of data loaded.
+- **Change in `my_dataloader.py`:**  
+  - Convert frames to grayscale in `load_all_frames`.
+  - Update the transformation function `to_normalized_float_tensor` (or add a new transform) so that single‑channel frames are handled correctly.
+
+These are the two main places you need to change in order to load fewer and grayscale (black‑and‑white) frames, which should help reduce the GPU load.
