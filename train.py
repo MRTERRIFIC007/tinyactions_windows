@@ -2,8 +2,7 @@ from matplotlib.pyplot import get
 import torch
 import numpy as np
 from Model.VideoSWIN import VideoSWIN3D
-from my_dataloader import TinyVIRAT_dataset, SingleVideoDataset
-from Preprocessing import get_prtn
+from my_dataloader import TinyVIRAT_dataset, get_video_data
 from asam import ASAM
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -11,6 +10,9 @@ from utils.visualize import get_plot
 from sklearn.metrics import accuracy_score
 import os
 import multiprocessing
+import traceback
+import gc
+import config as cfg
 
 exp = '23'
 
@@ -27,146 +29,238 @@ def compute_accuracy(pred, target, inf_th):
     return accuracy_score(pred, target)
 
 def main():
-    # Check for MPS (Metal) or CPU
-    if torch.backends.mps.is_available():
-        print("Using MPS (Metal)....")
-        device = torch.device("mps")
-    else:
-        print("Using CPU....")
+    try:
+        # Training Parameters
+        shuffle = True
+        print("Creating params....")
+        params = {'batch_size': 2,
+                  'shuffle': shuffle,
+                  'num_workers': 0}  # Set to 0 to avoid multiprocessing issues
+
+        max_epochs = 3
+        inf_threshold = 0.6
+        print(params)
+    except Exception as e:
+        print("Error during training parameter initialization:", str(e))
+        traceback.print_exc()
+        return
+
+    # Device selection: Use CUDA if available, check for MPS, else default to CPU
+    try:
+        if torch.cuda.is_available():
+            print("Using CUDA in train.py....")
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            print("Using MPS (Metal) in train.py....")
+            device = torch.device("mps")
+        else:
+            print("Using CPU in train.py....")
+            device = torch.device("cpu")
+    except Exception as e:
+        print("Error in device selection in train.py, defaulting to CPU:", e)
         device = torch.device("cpu")
 
-    # Training Parameters
-    shuffle = True
-    print("Creating params....")
-    params = {'batch_size': 2,
-              'shuffle': shuffle,
-              'num_workers': 0}  # Set to 0 to avoid multiprocessing issues
-
-    max_epochs = 50
-    inf_threshold = 0.6
-    print(params)
+    # If using CUDA, enable pin_memory in DataLoader for faster data transfer
+    if device.type == 'cuda':
+        params['pin_memory'] = True
+        print("pin_memory enabled for DataLoader")
 
     ############ Data Generators ############
-    # Comment out or remove the original calls to get_prtn:
-    # train_list_IDs, train_labels, train_IDs_path = get_prtn('train')
-    # train_dataset = TinyVIRAT_dataset(list_IDs=train_list_IDs, labels=train_labels, IDs_path=train_IDs_path)
-    # training_generator = DataLoader(train_dataset, **params)
+    # CHANGE THIS PATH: Update the following path to the location of your training videos on your system
+    try:
+        video_root = cfg.file_paths['train_data']
+        # Recursively collect video file paths and dummy labels from the folder
+        list_IDs, labels, IDs_path = get_video_data(video_root)
+        print(f"Found {len(list_IDs)} video(s) in {video_root}")
 
-    # Set the path to your single video file
-    single_video_path = '/Users/mrterrific/Documents/Tinyactions/TinyActions/video.mp4'
-    # Create the dataset directly
-    train_dataset = SingleVideoDataset(video_path=single_video_path)
-    training_generator = DataLoader(train_dataset, **params)
+        # Create the dataset using TinyVIRAT_dataset
+        train_dataset = TinyVIRAT_dataset(list_IDs=list_IDs, IDs_path=IDs_path, labels=labels, frame_by_frame=False)
+        training_generator = DataLoader(train_dataset, **params)
+    except Exception as e:
+        print("Error while creating data generator:", str(e))
+        traceback.print_exc()
+        return
 
     # Optionally, you may want to also override the validation set or remove it entirely,
     # depending on your experiment setup.
 
-    # Initialize the model
-    model = VideoSWIN3D(
-        num_classes=26,
-        patch_size=(2,4,4),
-        in_chans=3,
-        embed_dim=96,
-        depths=[2, 2, 6, 2],
-        num_heads=[3, 6, 12, 24],
-        window_size=(8,7,7),
-        mlp_ratio=4.
-    ).to(device)
+    try:
+        # Initialize the model with standard parameters
+        model = VideoSWIN3D(
+            num_classes=26,
+            patch_size=(2,4,4),
+            in_chans=3,
+            embed_dim=96,
+            depths=[2, 2, 6, 2],
+            num_heads=[3, 6, 12, 24],
+            window_size=(8,7,7),
+            mlp_ratio=4.
+        ).to(device)
+    except Exception as e:
+        print("Error while initializing the model:", e)
+        traceback.print_exc()
+        print("Attempting to initialize a smaller model due to potential GPU memory issues...")
+        model = VideoSWIN3D(
+            num_classes=26,
+            patch_size=(2,4,4),
+            in_chans=3,
+            embed_dim=32,    # reduced embedding dimension for a smaller model
+            depths=[1, 1, 2, 1],    # shallower network
+            num_heads=[2, 2, 2, 2],  # fewer attention heads
+            window_size=(8,7,7),
+            mlp_ratio=4.
+        ).to(device)
 
-    # Load pre-trained weights if available
-    pretrained_path = '/path/to/your/pretrained/weights.pth'
-    if os.path.exists(pretrained_path):
-        model.load_pretrained_weights(pretrained_path)
-    else:
-        print("No pre-trained weights found. Training from scratch.")
+    try:
+        # Load pre-trained weights if available
+        pretrained_path = '/path/to/your/pretrained/weights.pth'
+        if os.path.exists(pretrained_path):
+            model.load_pretrained_weights(pretrained_path)
+        else:
+            print("No pre-trained weights found. Training from scratch.")
+    except Exception as e:
+        print("Error while loading pre-trained weights:", str(e))
+        traceback.print_exc()
+        # Not fatal; continuing...
 
-    # Define loss and optimizer
-    lr = 0.02
-    wt_decay = 5e-4
-    criterion = torch.nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wt_decay)
+    try:
+        # Define loss and optimizer
+        lr = 0.02
+        wt_decay = 5e-4
+        criterion = torch.nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wt_decay)
 
-    # ASAM
-    rho = 0.55
-    eta = 0.01
-    minimizer = ASAM(optimizer, model, rho=rho, eta=eta)
+        # ASAM
+        rho = 0.55
+        eta = 0.01
+        minimizer = ASAM(optimizer, model, rho=rho, eta=eta)
+    except Exception as e:
+        print("Error during loss, optimizer, or ASAM initialization:", str(e))
+        traceback.print_exc()
+        return
 
     # Training and validation loops
     epoch_loss_train = []
-    epoch_loss_val = []
     epoch_acc_train = []
-    epoch_acc_val = []
 
     best_accuracy = 0.
     print("Begin Training....")
     for epoch in range(max_epochs):
-        # Train
-        model.train()
-        loss = 0.
-        accuracy = 0.
-        cnt = 0.
+        try:
+            # Train
+            model.train()
+            loss = 0.
+            accuracy = 0.
+            cnt = 0.
 
-        for batch_idx, (inputs, targets) in enumerate(tqdm(training_generator)):
-            inputs = inputs.to(device)
-            targets = targets.to(device)
+            for batch_idx, (inputs, targets) in enumerate(tqdm(training_generator)):
+                try:
+                    inputs = inputs.to(device)
+                    targets = targets.to(device)
 
-            optimizer.zero_grad()
+                    optimizer.zero_grad()
 
-            # Ascent Step
-            predictions = model(inputs.float())
-            batch_loss = criterion(predictions, targets)
-            batch_loss.mean().backward()
-            minimizer.ascent_step()
+                    # Ascent Step
+                    predictions = model(inputs.float())
+                    batch_loss = criterion(predictions, targets)
+                    batch_loss.mean().backward()
+                    minimizer.ascent_step()
 
-            # Descent Step
-            criterion(model(inputs.float()), targets).mean().backward()
-            minimizer.descent_step()
+                    # Descent Step
+                    descent_loss = criterion(model(inputs.float()), targets)
+                    descent_loss.mean().backward()
+                    minimizer.descent_step()
 
-            with torch.no_grad():
-                loss += batch_loss.sum().item()
-                accuracy += compute_accuracy(predictions, targets, inf_threshold)
-            cnt += len(targets)  # number of samples
-
-        loss /= cnt
-        accuracy /= (batch_idx + 1)
-        print(f"Epoch: {epoch}, Train accuracy: {accuracy:6.2f} %, Train loss: {loss:8.5f}")
-        epoch_loss_train.append(loss)
-        epoch_acc_train.append(accuracy)
-
-        # Validation
-        model.eval()
-        loss = 0.
-        accuracy = 0.
-        cnt = 0.
-        with torch.no_grad():
-            for batch_idx, (inputs, targets) in enumerate(val_generator):
-                inputs = inputs.to(device)
-                targets = targets.to(device)
-                predictions = model(inputs.float())
-                loss += criterion(predictions, targets).sum().item()
-                accuracy += compute_accuracy(predictions, targets, inf_threshold)
-                cnt += len(targets)
+                    with torch.no_grad():
+                        loss += batch_loss.sum().item()
+                        accuracy += compute_accuracy(predictions, targets, inf_threshold)
+                    cnt += len(targets)
+                except RuntimeError as e:
+                    if 'out of memory' in str(e):
+                        print(f"CUDA out of memory encountered on batch {batch_idx} at epoch {epoch}. Clearing cache, collecting garbage, and printing memory summary.")
+                        if torch.cuda.is_available():
+                            print(torch.cuda.memory_summary(device=device))
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        continue
+                    else:
+                        print(f"Runtime error processing batch {batch_idx} in epoch {epoch}: {str(e)}")
+                        traceback.print_exc()
+                        continue
+                except Exception as batch_e:
+                    print(f"Error processing batch {batch_idx} in epoch {epoch}: {str(batch_e)}")
+                    traceback.print_exc()
+                    continue
 
             loss /= cnt
             accuracy /= (batch_idx + 1)
+            print(f"Epoch: {epoch}, Train accuracy: {accuracy:6.2f} %, Train loss: {loss:8.5f}")
+            epoch_loss_train.append(loss)
+            epoch_acc_train.append(accuracy)
 
-        if best_accuracy < accuracy:
-            best_accuracy = accuracy
-            torch.save(model.state_dict(), PATH + exp + '_best_ckpt.pt')
+            # Save best model based on training accuracy
+            if best_accuracy < accuracy:
+                best_accuracy = accuracy
+                torch.save(model.state_dict(), PATH + exp + '_best_ckpt.pt')
+        except Exception as epoch_e:
+            print(f"Error during epoch {epoch}: {str(epoch_e)}")
+            traceback.print_exc()
+            continue   # Skip the epoch and continue to the next one
 
-        print(f"Epoch: {epoch}, Test accuracy: {accuracy:6.2f} %, Test loss: {loss:8.5f}")
-        epoch_loss_val.append(loss)
-        epoch_acc_val.append(accuracy)
-
-    print(f"Best test accuracy: {best_accuracy}")
+    print(f"Best train accuracy: {best_accuracy}")
     print("TRAINING COMPLETED :)")
 
-    # Save visualization
-    get_plot(PATH, epoch_acc_train, epoch_acc_val, 'Accuracy-' + exp, 'Train Accuracy', 'Val Accuracy', 'Epochs', 'Acc')
-    get_plot(PATH, epoch_loss_train, epoch_loss_val, 'Loss-' + exp, 'Train Loss', 'Val Loss', 'Epochs', 'Loss')
+    # Testing phase on the same single video dataset
+    try:
+        print("Testing on the entire training dataset...")
+        model.eval()
+        test_loss = 0.
+        test_accuracy = 0.
+        cnt = 0.
+        with torch.no_grad():
+            for test_batch_idx, (inputs, targets) in enumerate(tqdm(training_generator, desc="Testing")):
+                try:
+                    inputs = inputs.to(device)
+                    targets = targets.to(device)
+                    predictions = model(inputs.float())
+                    test_loss += criterion(predictions, targets).sum().item()
+                    test_accuracy += compute_accuracy(predictions, targets, inf_threshold)
+                    cnt += len(targets)
+                except RuntimeError as e:
+                    if 'out of memory' in str(e):
+                        print(f"CUDA out of memory encountered on test batch {test_batch_idx}. Clearing cache, collecting garbage, and printing memory summary.")
+                        if torch.cuda.is_available():
+                            print(torch.cuda.memory_summary(device=device))
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        continue
+                    else:
+                        raise e
+                except Exception as e:
+                    print(f"Error in test batch {test_batch_idx}: {str(e)}")
+                    traceback.print_exc()
+                    continue
+            test_loss /= cnt
+            test_accuracy /= (test_batch_idx + 1)
+        print(f"Test metrics - Accuracy: {test_accuracy:6.2f} %, Loss: {test_loss:8.5f}")
+    except Exception as test_e:
+        print("Error during testing:", str(test_e))
+        traceback.print_exc()
 
-    # Save trained model
-    torch.save(model, exp + "_ckpt.pt")
+    try:
+        # Save visualization
+        get_plot(PATH, epoch_acc_train, None, 'Accuracy-' + exp, 'Train Accuracy', 'Val Accuracy (N/A)', 'Epochs', 'Acc')
+        get_plot(PATH, epoch_loss_train, None, 'Loss-' + exp, 'Train Loss', 'Val Loss (N/A)', 'Epochs', 'Loss')
+    except Exception as e:
+        print("Error while plotting:", str(e))
+        traceback.print_exc()
+
+    try:
+        # Save trained model
+        torch.save(model, exp + "_ckpt.pt")
+    except Exception as e:
+        print("Error while saving the trained model:", str(e))
+        traceback.print_exc()
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()

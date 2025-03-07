@@ -1,11 +1,14 @@
+import os
 import matplotlib.pyplot as plt
 
-def get_plot(path,A,B,title,lblA,lblB,xlabel='Epochs',ylabel='Mean Loss',savefig=True,showfig=False):
+def get_plot(path, A, B, filename, labelA, labelB, xlabel, ylabel):
 	plt.figure()
-	plt.plot(A,'-bo',label=lblA)
-	plt.plot(B,'-ro',label=lblB)
+	if A is not None:
+		plt.plot(A, '-bo', label=labelA)
+	if B is not None:
+		plt.plot(B, '-ro', label=labelB)
 	plt.xlabel(xlabel)
 	plt.ylabel(ylabel)
-	plt.title(title)
 	plt.legend()
-	plt.savefig(path+title+'.png')
+	plt.savefig(os.path.join(path, filename+'.png'))
+	plt.close()

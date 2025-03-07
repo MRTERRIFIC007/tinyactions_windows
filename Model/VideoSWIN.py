@@ -645,7 +645,7 @@ class VideoSWIN3D(nn.Module):
 
     def forward(self, x):
         x = self.backbone(x)
-        print(f"Shape after backbone: {x.shape}")  # Add this line
+        # print("Shape after backbone:", x.shape)  # Add this line
         return self.head(x)
 
     def load_pretrained_weights(self, path):

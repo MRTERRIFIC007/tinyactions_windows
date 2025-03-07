@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 import config as cfg
 import Preprocessing
+import os
 
 ############ Helper Functions ##############
 def resize(frames, size, interpolation='bilinear'):
@@ -46,8 +47,8 @@ class Normalize(object):
 ################# TinyVIRAT Dataset ###################
 class TinyVIRAT_dataset(Dataset):
     'Characterizes a dataset for PyTorch'
-    def __init__(self, list_IDs, IDs_path, labels, num_frames=cfg.video_params['num_frames'], input_size=cfg.video_params['height']):
-        'Initialization'
+    def __init__(self, list_IDs, IDs_path, labels, num_frames=cfg.video_params['num_frames'], input_size=cfg.video_params['height'], frame_by_frame=False):
+        "Initialization"
         self.labels = labels
         self.list_IDs = list_IDs
         self.IDs_path = IDs_path
@@ -57,12 +58,30 @@ class TinyVIRAT_dataset(Dataset):
         self.normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         self.transform = transforms.Compose([ToFloatTensorInZeroOne(), self.resize, self.normalize])
         
-        # If only one video is given, pre-load all its frames
+        # For single video scenario, load all frames
         if len(self.list_IDs) == 1:
             video_path = self.IDs_path[self.list_IDs[0]]
-            self.single_video_frames = self.load_all_frames(video_path)  # Expected shape: (T, H, W, C)
+            self.single_video_frames = self.load_all_frames(video_path)
+            self.frame_by_frame = False
+            self.frame_index_map = None
         else:
             self.single_video_frames = None
+            self.frame_by_frame = frame_by_frame
+            if self.frame_by_frame:
+                # Build a mapping from a global sample index to (video_id, frame_index)
+                self.frame_index_map = []
+                for vid in self.list_IDs:
+                    path = self.IDs_path[vid]
+                    cap = cv2.VideoCapture(path)
+                    if not cap.isOpened():
+                        print(f"Warning: Could not open video {vid}")
+                        continue
+                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    cap.release()
+                    for i in range(frame_count):
+                        self.frame_index_map.append((vid, i))
+            else:
+                self.frame_index_map = None
 
     def load_all_frames(self, video_path):
         vidcap = cv2.VideoCapture(video_path)
@@ -101,38 +120,64 @@ class TinyVIRAT_dataset(Dataset):
         'Denotes the total number of samples'
         if self.single_video_frames is not None:
             return self.single_video_frames.shape[0]
+        if self.frame_index_map is not None:
+            return len(self.frame_index_map)
         return len(self.list_IDs)
 
     def __getitem__(self, index):
         'Generates one sample of data'
-        # For a single video scenario, treat each frame as an individual sample.
         if self.single_video_frames is not None:
-            # Get the frame at the particular index. self.single_video_frames is (T, H, W, C)
+            # For single video case, each frame is a sample.
             frame = self.single_video_frames[index]
-            # Wrap the frame in a new axis so it represents a "video" with 1 frame (T=1)
-            frame = frame.unsqueeze(0)  # Now shape is (1, H, W, C)
-            # Apply the same transformation chain that would be used for the full video.
+            frame = frame.unsqueeze(0)
             X = self.transform(frame)
-            # Use the same label for every frame since it's from the single video.
+            X = X.to(device)  # move tensor to GPU if available
             y = torch.Tensor(self.labels[self.list_IDs[0]])
             return X, y
+        elif self.frame_index_map is not None:
+            # Frame-by-frame mode for multiple videos.
+            vid, frame_num = self.frame_index_map[index]
+            video_path = self.IDs_path[vid]
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = cap.read()
+            cap.release()
+            if not ret:
+                raise Exception(f"Could not read frame {frame_num} from video {vid}")
+            # Convert frame from BGR to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Convert frame to tensor (H, W, C)
+            frame = torch.from_numpy(frame)
+            # Unsqueeze to add temporal dimension: (1, H, W, C)
+            frame = frame.unsqueeze(0)
+            X = self.transform(frame)
+            X = X.to(device)  # move tensor to GPU if available
+            y = torch.Tensor(self.labels[vid])
+            return X, y
         else:
-            # Original implementation for multiple videos:
+            # Default: treat each video as one sample (build a clip)
             ID = self.list_IDs[index]
+            if index % 100 == 0:
+                print(f"Loading video {index}: {ID}")
             sample_path = self.IDs_path[ID]
             X = self.build_sample(sample_path)
-            if len(self.labels) > 0:
-                y = torch.Tensor(self.labels[ID])
-            else:
-                y = torch.Tensor([])
+            X = X.to(device)  # move tensor to GPU if available
+            y = torch.Tensor(self.labels[ID])
             return X, y
 
-# Adjust for macOS Metal (MPS) device support
-if torch.backends.mps.is_available():
-    print("Using Metal (MPS) backend....")
-    device = torch.device("mps")
-else:
-    print("Using CPU....")
+# Adjust for CUDA, MPS, or CPU device support
+try:
+    if torch.cuda.is_available():
+        print("Using CUDA....")
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        print("Using Metal (MPS) backend....")
+        device = torch.device("mps")
+    else:
+        print("Using CPU....")
+        device = torch.device("cpu")
+except Exception as e:
+    print("Error in device selection, defaulting to CPU:", e)
     device = torch.device("cpu")
 
 # Ensure tensors and models are moved to the appropriate device
@@ -177,6 +222,41 @@ class SingleVideoDataset(Dataset):
         frame = frame.unsqueeze(0)  # Now shape is (1, H, W, C)
         # Apply the transformation pipeline
         X = self.transform(frame)
+        X = X.to(device)  # move tensor to GPU if available
         # Create a dummy label (for example, a zero tensor of dimension [num_classes])
         y = torch.zeros(cfg.constants['num_classes'])
         return X, y
+
+# Add the helper function to recursively obtain video file paths and dummy labels
+def get_video_data(root_path, num_classes=26):
+    """
+    Recursively collect video file paths from the given root folder.
+    
+    Args:
+        root_path (str): Path to the folder containing training videos (and subfolders).
+        num_classes (int): Number of classes. Dummy labels will be vectors of zeros.
+        
+    Returns:
+        list_IDs (list): Unique IDs for each video (based on relative paths).
+        labels (dict): Mapping from video ID to dummy labels (zero vector of length num_classes).
+        IDs_path (dict): Mapping from video ID to its full file path.
+    """
+    list_IDs = []
+    IDs_path = {}
+    labels = {}
+    for subdir, dirs, files in os.walk(root_path):
+        for file in files:
+            if file.endswith('.mp4'):
+                full_path = os.path.join(subdir, file)
+                # Use the relative path as a unique video ID
+                video_id = os.path.relpath(full_path, root_path)
+                list_IDs.append(video_id)
+                IDs_path[video_id] = full_path
+                labels[video_id] = [0] * num_classes
+    return list_IDs, labels, IDs_path
+
+if __name__ == '__main__':
+    # Optionally test the get_video_data function
+    video_root = cfg.file_paths['train_data']
+    list_IDs, labels, IDs_path = get_video_data(video_root)
+    print(f"Found {len(list_IDs)} video(s) in {video_root}")
