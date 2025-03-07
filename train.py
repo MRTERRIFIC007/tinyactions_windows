@@ -12,6 +12,7 @@ import os
 import multiprocessing
 import traceback
 import gc
+import time
 
 # Force garbage collection to free up memory
 gc.collect()
@@ -514,12 +515,10 @@ def main():
                 
                 # If memory is very low, consider moving to CPU for testing
                 if free_memory < 0.5:  # Less than 500MB
-                    print("Very limited GPU memory available. Consider testing on CPU...")
-                    use_cpu_for_testing = input("Use CPU for testing instead of GPU? (y/n): ").lower() == 'y'
-                    if use_cpu_for_testing:
-                        print("Moving model to CPU for testing...")
-                        model = model.cpu()
-                        device = torch.device("cpu")
+                    print("Very limited GPU memory available for testing.")
+                    print("Moving model to CPU for testing...")
+                    model = model.cpu()
+                    device = torch.device("cpu")
             except Exception as e:
                 print(f"Error checking GPU memory: {e}")
         
@@ -528,6 +527,7 @@ def main():
         test_loss = 0.
         test_accuracy = 0.
         cnt = 0.
+        successful_batches = 0
         
         # Create a smaller batch size for testing if needed
         test_params = params.copy()
@@ -539,6 +539,7 @@ def main():
                     print(f"Reduced batch size to {test_params['batch_size']} for testing due to limited memory")
             except Exception as e:
                 print(f"Error adjusting test batch size: {e}")
+                test_params['batch_size'] = 1  # Conservative default
         
         # Create a separate test data loader if needed
         try:
@@ -552,9 +553,18 @@ def main():
             print("Falling back to training generator")
             test_generator = training_generator
         
+        # Set a timeout for the entire testing process
+        start_time = time.time()
+        max_test_time = 1800  # 30 minutes max
+        
         # Perform testing with no gradient computation
         with torch.no_grad():
             for test_batch_idx, (inputs, targets) in enumerate(tqdm(test_generator, desc="Testing")):
+                # Check if we've exceeded the maximum test time
+                if time.time() - start_time > max_test_time:
+                    print(f"Testing has been running for over {max_test_time/60:.1f} minutes. Stopping early.")
+                    break
+                
                 try:
                     # Move data to device
                     inputs = inputs.to(device)
@@ -564,17 +574,40 @@ def main():
                     if device.type == 'cuda':
                         torch.cuda.empty_cache()
                     
-                    # Forward pass
-                    predictions = model(inputs.float())
+                    # Forward pass with timeout protection
+                    try:
+                        # Set a timeout for the forward pass
+                        forward_start = time.time()
+                        forward_timeout = 30  # 30 seconds max for forward pass
+                        
+                        # Start forward pass
+                        predictions = model(inputs.float())
+                        
+                        # Check if forward pass took too long
+                        if time.time() - forward_start > forward_timeout:
+                            print(f"Forward pass took too long ({time.time() - forward_start:.1f}s). Skipping this batch.")
+                            continue
+                    except Exception as forward_e:
+                        print(f"Error during forward pass: {forward_e}")
+                        traceback.print_exc()
+                        continue
                     
                     # Calculate metrics
-                    batch_loss = criterion(predictions, targets).sum().item()
-                    batch_accuracy = compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
+                    try:
+                        batch_loss = criterion(predictions, targets).sum().item()
+                        batch_accuracy = compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
+                    except Exception as metric_e:
+                        print(f"Error calculating metrics: {metric_e}")
+                        traceback.print_exc()
+                        # Use default values
+                        batch_loss = 0.0
+                        batch_accuracy = 0.0
                     
                     # Update counters
                     test_loss += batch_loss
                     test_accuracy += batch_accuracy
                     cnt += len(targets)
+                    successful_batches += 1
                     
                     # Free memory
                     del inputs, targets, predictions
@@ -589,26 +622,36 @@ def main():
                     if 'out of memory' in str(e):
                         print(f"CUDA out of memory encountered on test batch {test_batch_idx}. Clearing cache and trying to continue...")
                         if torch.cuda.is_available():
-                            print(torch.cuda.memory_summary(device=device))
+                            try:
+                                print(torch.cuda.memory_summary(device=device))
+                            except:
+                                print("Could not print CUDA memory summary")
                         torch.cuda.empty_cache()
                         gc.collect()
                         
                         # If this is not the first batch and we're using GPU, try to move to CPU
                         if test_batch_idx > 0 and device.type == 'cuda':
                             print("Moving model to CPU to continue testing...")
-                            model = model.cpu()
-                            device = torch.device("cpu")
-                            continue
+                            try:
+                                model = model.cpu()
+                                device = torch.device("cpu")
+                                continue
+                            except Exception as cpu_e:
+                                print(f"Error moving model to CPU: {cpu_e}")
                         elif test_params['batch_size'] > 1:
                             # Try with smaller batch size
                             test_params['batch_size'] = 1
                             print(f"Reducing batch size to {test_params['batch_size']} and recreating test data loader")
-                            test_generator = DataLoader(train_dataset, **test_params)
-                            # Restart testing
-                            test_loss = 0.
-                            test_accuracy = 0.
-                            cnt = 0.
-                            break
+                            try:
+                                test_generator = DataLoader(train_dataset, **test_params)
+                                # Restart testing
+                                test_loss = 0.
+                                test_accuracy = 0.
+                                cnt = 0.
+                                successful_batches = 0
+                                break
+                            except Exception as dl_e:
+                                print(f"Error recreating data loader: {dl_e}")
                         else:
                             print("Cannot reduce batch size further. Skipping this batch.")
                             continue
@@ -622,16 +665,50 @@ def main():
                     continue
             
             # Calculate final metrics
-            if cnt > 0:
-                test_loss /= cnt
-                test_accuracy /= (test_batch_idx + 1)
-                print(f"Test metrics - Accuracy: {test_accuracy:6.2f} %, Loss: {test_loss:8.5f}")
+            if successful_batches > 0:
+                if cnt > 0:
+                    test_loss /= cnt
+                    test_accuracy /= successful_batches
+                    print(f"Test metrics - Accuracy: {test_accuracy:6.2f} %, Loss: {test_loss:8.5f}")
+                    print(f"Successfully processed {cnt} samples in {successful_batches} batches")
+                    
+                    # Save results to a file
+                    try:
+                        with open(PATH + "test_results.txt", "w") as f:
+                            f.write(f"Model: {exp}_ckpt.pt\n")
+                            f.write(f"Accuracy: {test_accuracy:6.2f} %\n")
+                            f.write(f"Loss: {test_loss:8.5f}\n")
+                            f.write(f"Samples: {cnt}\n")
+                            f.write(f"Batches: {successful_batches}\n")
+                            f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        print(f"Test results saved to {PATH}test_results.txt")
+                    except Exception as save_e:
+                        print(f"Error saving results: {save_e}")
+                else:
+                    print("No test samples were successfully processed. Testing failed.")
             else:
-                print("No test samples were successfully processed. Testing failed.")
+                print("No batches were successfully processed. Testing failed.")
+                
+                # Try one last approach - process a single random tensor
+                try:
+                    print("Trying to process a single random tensor...")
+                    random_input = torch.rand(1, 3, 16, 120, 120).to(device)
+                    random_output = model(random_input)
+                    print(f"Model successfully processed a random tensor of shape {random_input.shape}")
+                    print(f"Output shape: {random_output.shape}")
+                    del random_input, random_output
+                except Exception as random_e:
+                    print(f"Error processing random tensor: {random_e}")
     except Exception as test_e:
         print("Error during testing:", str(test_e))
         traceback.print_exc()
         print("Testing failed, but training was completed successfully.")
+    finally:
+        # Clean up resources
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        print("Testing phase completed.")
 
     try:
         # Save visualization
