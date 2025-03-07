@@ -48,8 +48,16 @@ def main():
     # Device selection: Use CUDA if available, check for MPS, else default to CPU
     try:
         if torch.cuda.is_available():
-            print("Using CUDA in train.py....")
-            device = torch.device("cuda")
+            try:
+                # Test if CUDA is actually working by creating a small tensor
+                test_tensor = torch.zeros(1).cuda()
+                del test_tensor  # Free memory
+                print("Using CUDA in train.py....")
+                device = torch.device("cuda")
+            except RuntimeError as e:
+                print(f"CUDA is available but encountered an error: {e}")
+                print("Falling back to CPU...")
+                device = torch.device("cpu")
         elif torch.backends.mps.is_available():
             print("Using MPS (Metal) in train.py....")
             device = torch.device("mps")
@@ -79,10 +87,15 @@ def main():
             
             # Try multiple possible locations for the sample video
             script_dir = os.path.dirname(os.path.abspath(__file__))
+            cwd = os.getcwd()
             possible_paths = [
                 os.path.join(script_dir, 'video.mp4'),  # In the same directory as train.py
                 os.path.join(script_dir, '..', 'video.mp4'),  # One level up
                 os.path.join(script_dir, '..', '..', 'video.mp4'),  # Two levels up
+                os.path.join(cwd, 'video.mp4'),  # In the current working directory
+                '/workspace/video.mp4',  # Root of workspace (common in Docker/Jupyter)
+                '/workspace/Tinyactions_2/video.mp4',  # Common Docker/Jupyter path
+                '/workspace/Tinyactions_2/tinyactions_windows/video.mp4',  # Specific to your environment
             ]
             
             sample_video_path = None
@@ -99,16 +112,25 @@ def main():
                 list_IDs, labels, IDs_path = dummy_list_IDs, dummy_labels, dummy_IDs_path
                 print(f"Using sample video: {sample_video_path}")
             else:
-                # If sample video not found, try to copy it from the current directory to the train directory
+                # If sample video not found, try to download one
                 try:
-                    from setup_sample import setup_sample_video
-                    if setup_sample_video():
-                        # Try again to get videos after setup
+                    print("Sample video not found. Attempting to download a sample video...")
+                    from download_sample import download_sample_video
+                    if download_sample_video():
+                        # Try again to get videos after download
                         list_IDs, labels, IDs_path = get_video_data(video_root)
                         if len(list_IDs) == 0:
-                            raise FileNotFoundError("Could not find or set up sample video")
+                            raise FileNotFoundError("Could not find or download sample video")
                     else:
-                        raise FileNotFoundError("Could not find or set up sample video")
+                        # If download fails, try the setup script
+                        from setup_sample import setup_sample_video
+                        if setup_sample_video():
+                            # Try again to get videos after setup
+                            list_IDs, labels, IDs_path = get_video_data(video_root)
+                            if len(list_IDs) == 0:
+                                raise FileNotFoundError("Could not find, download, or set up sample video")
+                        else:
+                            raise FileNotFoundError("Could not find, download, or set up sample video")
                 except Exception as e:
                     print(f"Error setting up sample video: {e}")
                     raise
@@ -135,21 +157,60 @@ def main():
             num_heads=[3, 6, 12, 24],
             window_size=(8,7,7),
             mlp_ratio=4.
-        ).to(device)
+        )
+        
+        # Try to move model to the selected device, fall back to CPU if there's an error
+        try:
+            model = model.to(device)
+        except RuntimeError as cuda_err:
+            if device.type == 'cuda':
+                print(f"Error moving model to CUDA: {cuda_err}")
+                print("Falling back to CPU...")
+                device = torch.device("cpu")
+                model = model.to(device)
+            else:
+                raise  # Re-raise if it's not a CUDA device
     except Exception as e:
         print("Error while initializing the model:", e)
         traceback.print_exc()
         print("Attempting to initialize a smaller model due to potential GPU memory issues...")
-        model = VideoSWIN3D(
-            num_classes=26,
-            patch_size=(2,4,4),
-            in_chans=3,
-            embed_dim=32,    # reduced embedding dimension for a smaller model
-            depths=[1, 1, 2, 1],    # shallower network
-            num_heads=[2, 2, 2, 2],  # fewer attention heads
-            window_size=(8,7,7),
-            mlp_ratio=4.
-        ).to(device)
+        try:
+            model = VideoSWIN3D(
+                num_classes=26,
+                patch_size=(2,4,4),
+                in_chans=3,
+                embed_dim=32,    # reduced embedding dimension for a smaller model
+                depths=[1, 1, 2, 1],    # shallower network
+                num_heads=[2, 2, 2, 2],  # fewer attention heads
+                window_size=(8,7,7),
+                mlp_ratio=4.
+            )
+            
+            # Try to move model to the selected device, fall back to CPU if there's an error
+            try:
+                model = model.to(device)
+            except RuntimeError as cuda_err:
+                if device.type == 'cuda':
+                    print(f"Error moving smaller model to CUDA: {cuda_err}")
+                    print("Falling back to CPU...")
+                    device = torch.device("cpu")
+                    model = model.to(device)
+                else:
+                    raise  # Re-raise if it's not a CUDA device
+        except Exception as e2:
+            print(f"Error initializing smaller model: {e2}")
+            print("Falling back to CPU with minimal model...")
+            device = torch.device("cpu")
+            model = VideoSWIN3D(
+                num_classes=26,
+                patch_size=(2,4,4),
+                in_chans=3,
+                embed_dim=16,    # minimal embedding dimension
+                depths=[1, 1, 1, 1],    # minimal depth
+                num_heads=[1, 1, 1, 1],  # minimal heads
+                window_size=(8,7,7),
+                mlp_ratio=4.
+            ).to(device)
 
     try:
         # Load pre-trained weights if available
