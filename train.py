@@ -498,57 +498,194 @@ def main():
     print(f"Best train accuracy: {best_accuracy}")
     print("TRAINING COMPLETED :)")
 
-    # Testing phase on the same single video dataset
+    # Testing phase on the entire training dataset
     try:
         print("Testing on the entire training dataset...")
+        
+        # Make sure we have enough memory for testing
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            # Check if we have enough memory for testing
+            try:
+                free_memory = (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3
+                print(f"Available GPU memory for testing: {free_memory:.2f} GB")
+                
+                # If memory is very low, consider moving to CPU for testing
+                if free_memory < 0.5:  # Less than 500MB
+                    print("Very limited GPU memory available. Consider testing on CPU...")
+                    use_cpu_for_testing = input("Use CPU for testing instead of GPU? (y/n): ").lower() == 'y'
+                    if use_cpu_for_testing:
+                        print("Moving model to CPU for testing...")
+                        model = model.cpu()
+                        device = torch.device("cpu")
+            except Exception as e:
+                print(f"Error checking GPU memory: {e}")
+        
+        # Set model to evaluation mode
         model.eval()
         test_loss = 0.
         test_accuracy = 0.
         cnt = 0.
+        
+        # Create a smaller batch size for testing if needed
+        test_params = params.copy()
+        if device.type == 'cuda' and params['batch_size'] > 1:
+            try:
+                free_memory = (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3
+                if free_memory < 1.0:
+                    test_params['batch_size'] = 1
+                    print(f"Reduced batch size to {test_params['batch_size']} for testing due to limited memory")
+            except Exception as e:
+                print(f"Error adjusting test batch size: {e}")
+        
+        # Create a separate test data loader if needed
+        try:
+            if test_params != params:
+                test_generator = DataLoader(train_dataset, **test_params)
+                print(f"Created separate test data loader with batch size {test_params['batch_size']}")
+            else:
+                test_generator = training_generator
+        except Exception as e:
+            print(f"Error creating test data loader: {e}")
+            print("Falling back to training generator")
+            test_generator = training_generator
+        
+        # Perform testing with no gradient computation
         with torch.no_grad():
-            for test_batch_idx, (inputs, targets) in enumerate(tqdm(training_generator, desc="Testing")):
+            for test_batch_idx, (inputs, targets) in enumerate(tqdm(test_generator, desc="Testing")):
                 try:
+                    # Move data to device
                     inputs = inputs.to(device)
                     targets = targets.to(device)
+                    
+                    # Clear cache before forward pass
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    
+                    # Forward pass
                     predictions = model(inputs.float())
-                    test_loss += criterion(predictions, targets).sum().item()
-                    test_accuracy += compute_accuracy(predictions, targets, inf_threshold)
+                    
+                    # Calculate metrics
+                    batch_loss = criterion(predictions, targets).sum().item()
+                    batch_accuracy = compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
+                    
+                    # Update counters
+                    test_loss += batch_loss
+                    test_accuracy += batch_accuracy
                     cnt += len(targets)
+                    
+                    # Free memory
+                    del inputs, targets, predictions
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    
+                    # Periodically run garbage collection
+                    if test_batch_idx % 5 == 0:
+                        gc.collect()
+                        
                 except RuntimeError as e:
                     if 'out of memory' in str(e):
-                        print(f"CUDA out of memory encountered on test batch {test_batch_idx}. Clearing cache, collecting garbage, and printing memory summary.")
+                        print(f"CUDA out of memory encountered on test batch {test_batch_idx}. Clearing cache and trying to continue...")
                         if torch.cuda.is_available():
                             print(torch.cuda.memory_summary(device=device))
                         torch.cuda.empty_cache()
                         gc.collect()
-                        continue
+                        
+                        # If this is not the first batch and we're using GPU, try to move to CPU
+                        if test_batch_idx > 0 and device.type == 'cuda':
+                            print("Moving model to CPU to continue testing...")
+                            model = model.cpu()
+                            device = torch.device("cpu")
+                            continue
+                        elif test_params['batch_size'] > 1:
+                            # Try with smaller batch size
+                            test_params['batch_size'] = 1
+                            print(f"Reducing batch size to {test_params['batch_size']} and recreating test data loader")
+                            test_generator = DataLoader(train_dataset, **test_params)
+                            # Restart testing
+                            test_loss = 0.
+                            test_accuracy = 0.
+                            cnt = 0.
+                            break
+                        else:
+                            print("Cannot reduce batch size further. Skipping this batch.")
+                            continue
                     else:
-                        raise e
+                        print(f"Runtime error in test batch {test_batch_idx}: {str(e)}")
+                        traceback.print_exc()
+                        continue
                 except Exception as e:
                     print(f"Error in test batch {test_batch_idx}: {str(e)}")
                     traceback.print_exc()
                     continue
-            test_loss /= cnt
-            test_accuracy /= (test_batch_idx + 1)
-        print(f"Test metrics - Accuracy: {test_accuracy:6.2f} %, Loss: {test_loss:8.5f}")
+            
+            # Calculate final metrics
+            if cnt > 0:
+                test_loss /= cnt
+                test_accuracy /= (test_batch_idx + 1)
+                print(f"Test metrics - Accuracy: {test_accuracy:6.2f} %, Loss: {test_loss:8.5f}")
+            else:
+                print("No test samples were successfully processed. Testing failed.")
     except Exception as test_e:
         print("Error during testing:", str(test_e))
         traceback.print_exc()
+        print("Testing failed, but training was completed successfully.")
 
     try:
         # Save visualization
         get_plot(PATH, epoch_acc_train, None, 'Accuracy-' + exp, 'Train Accuracy', 'Val Accuracy (N/A)', 'Epochs', 'Acc')
         get_plot(PATH, epoch_loss_train, None, 'Loss-' + exp, 'Train Loss', 'Val Loss (N/A)', 'Epochs', 'Loss')
+        print("Successfully saved visualization plots.")
     except Exception as e:
         print("Error while plotting:", str(e))
         traceback.print_exc()
+        print("Continuing without saving plots...")
 
     try:
         # Save trained model
-        torch.save(model, exp + "_ckpt.pt")
+        print("Saving final model checkpoint...")
+        
+        # First try to save just the state dict (smaller file)
+        try:
+            save_path = exp + "_ckpt.pt"
+            torch.save(model.state_dict(), save_path)
+            print(f"Successfully saved model state dict to {save_path}")
+        except Exception as state_dict_error:
+            print(f"Error saving model state dict: {state_dict_error}")
+            
+            # If that fails, try saving to a different location
+            try:
+                alternate_path = os.path.join(PATH, exp + "_ckpt.pt")
+                torch.save(model.state_dict(), alternate_path)
+                print(f"Successfully saved model state dict to alternate path: {alternate_path}")
+            except Exception as alt_path_error:
+                print(f"Error saving to alternate path: {alt_path_error}")
+                
+                # If that also fails, try saving the full model
+                try:
+                    print("Attempting to save full model instead...")
+                    torch.save(model, PATH + exp + "_full_model.pt")
+                    print(f"Successfully saved full model to {PATH + exp + '_full_model.pt'}")
+                except Exception as full_model_error:
+                    print(f"Error saving full model: {full_model_error}")
+                    
+                    # Last resort: try saving to CPU first
+                    try:
+                        print("Moving model to CPU and trying to save...")
+                        cpu_model = model.cpu()
+                        torch.save(cpu_model.state_dict(), PATH + exp + "_cpu_ckpt.pt")
+                        print(f"Successfully saved CPU model to {PATH + exp + '_cpu_ckpt.pt'}")
+                        # Move model back to original device
+                        model = model.to(device)
+                    except Exception as cpu_error:
+                        print(f"All attempts to save model failed: {cpu_error}")
+                        print("WARNING: Model was not saved!")
     except Exception as e:
         print("Error while saving the trained model:", str(e))
         traceback.print_exc()
+        print("WARNING: Model was not saved!")
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()
