@@ -72,6 +72,46 @@ def main():
         # Recursively collect video file paths and dummy labels from the folder
         list_IDs, labels, IDs_path = get_video_data(video_root)
         print(f"Found {len(list_IDs)} video(s) in {video_root}")
+        
+        # If no videos found in the dataset directory, use the sample video
+        if len(list_IDs) == 0:
+            print("No videos found in the dataset directory. Using the sample video.mp4 instead.")
+            
+            # Try multiple possible locations for the sample video
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            possible_paths = [
+                os.path.join(script_dir, 'video.mp4'),  # In the same directory as train.py
+                os.path.join(script_dir, '..', 'video.mp4'),  # One level up
+                os.path.join(script_dir, '..', '..', 'video.mp4'),  # Two levels up
+            ]
+            
+            sample_video_path = None
+            for path in possible_paths:
+                if os.path.exists(path):
+                    sample_video_path = path
+                    break
+            
+            if sample_video_path:
+                # Create a single video dataset with dummy labels
+                dummy_list_IDs = ['sample_video']
+                dummy_labels = {'sample_video': [0] * cfg.constants['num_classes']}
+                dummy_IDs_path = {'sample_video': sample_video_path}
+                list_IDs, labels, IDs_path = dummy_list_IDs, dummy_labels, dummy_IDs_path
+                print(f"Using sample video: {sample_video_path}")
+            else:
+                # If sample video not found, try to copy it from the current directory to the train directory
+                try:
+                    from setup_sample import setup_sample_video
+                    if setup_sample_video():
+                        # Try again to get videos after setup
+                        list_IDs, labels, IDs_path = get_video_data(video_root)
+                        if len(list_IDs) == 0:
+                            raise FileNotFoundError("Could not find or set up sample video")
+                    else:
+                        raise FileNotFoundError("Could not find or set up sample video")
+                except Exception as e:
+                    print(f"Error setting up sample video: {e}")
+                    raise
 
         # Create the dataset using TinyVIRAT_dataset
         train_dataset = TinyVIRAT_dataset(list_IDs=list_IDs, IDs_path=IDs_path, labels=labels, frame_by_frame=False)
