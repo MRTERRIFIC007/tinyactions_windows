@@ -12,6 +12,12 @@ import os
 import multiprocessing
 import traceback
 import gc
+
+# Force garbage collection to free up memory
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
 import config as cfg
 
 exp = '23'
@@ -27,6 +33,61 @@ def compute_accuracy(pred, target, inf_th):
     pred = pred.cpu().data.numpy()
     pred = pred > inf_th
     return accuracy_score(pred, target)
+
+def get_optimal_device():
+    """
+    Find the optimal device to use based on available resources.
+    Returns the device with the most free memory or CPU if no suitable GPU is found.
+    """
+    try:
+        if not torch.cuda.is_available():
+            print("CUDA not available, using CPU...")
+            return torch.device("cpu")
+        
+        # Get the number of available GPUs
+        num_gpus = torch.cuda.device_count()
+        if num_gpus == 0:
+            print("No GPUs found, using CPU...")
+            return torch.device("cpu")
+        
+        # If only one GPU, use it
+        if num_gpus == 1:
+            # Test if it's actually working
+            try:
+                test_tensor = torch.zeros(1).cuda()
+                del test_tensor
+                print(f"Using single available GPU: {torch.cuda.get_device_name(0)}")
+                return torch.device("cuda:0")
+            except RuntimeError as e:
+                print(f"Error with GPU: {e}")
+                print("Falling back to CPU...")
+                return torch.device("cpu")
+        
+        # Multiple GPUs available, find the one with most free memory
+        free_memory = []
+        for i in range(num_gpus):
+            try:
+                torch.cuda.set_device(i)
+                torch.cuda.empty_cache()
+                free_memory.append(torch.cuda.memory_reserved(i) - torch.cuda.memory_allocated(i))
+                print(f"GPU {i} ({torch.cuda.get_device_name(i)}): {free_memory[-1]/1024**2:.1f} MB free")
+            except Exception as e:
+                print(f"Error checking GPU {i}: {e}")
+                free_memory.append(0)
+        
+        # Select the GPU with the most free memory
+        if max(free_memory) > 0:
+            best_gpu = free_memory.index(max(free_memory))
+            print(f"Selected GPU {best_gpu} with {free_memory[best_gpu]/1024**2:.1f} MB free memory")
+            return torch.device(f"cuda:{best_gpu}")
+        else:
+            print("No GPU with free memory found, using CPU...")
+            return torch.device("cpu")
+    
+    except Exception as e:
+        print(f"Error selecting device: {e}")
+        print("Falling back to CPU...")
+        return torch.device("cpu")
 
 def main():
     try:
@@ -45,31 +106,31 @@ def main():
         traceback.print_exc()
         return
 
-    # Device selection: Use CUDA if available, check for MPS, else default to CPU
-    try:
-        if torch.cuda.is_available():
-            try:
-                # Test if CUDA is actually working by creating a small tensor
-                test_tensor = torch.zeros(1).cuda()
-                del test_tensor  # Free memory
-                print("Using CUDA in train.py....")
-                device = torch.device("cuda")
-            except RuntimeError as e:
-                print(f"CUDA is available but encountered an error: {e}")
-                print("Falling back to CPU...")
-                device = torch.device("cpu")
-        elif torch.backends.mps.is_available():
-            print("Using MPS (Metal) in train.py....")
-            device = torch.device("mps")
-        else:
-            print("Using CPU in train.py....")
-            device = torch.device("cpu")
-    except Exception as e:
-        print("Error in device selection in train.py, defaulting to CPU:", e)
-        device = torch.device("cpu")
-
-    # If using CUDA, enable pin_memory in DataLoader for faster data transfer
+    # Get the optimal device
+    device = get_optimal_device()
+    
+    # Adjust batch size based on available memory
     if device.type == 'cuda':
+        try:
+            # Get available GPU memory in GB
+            free_memory = (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3
+            print(f"Available GPU memory: {free_memory:.2f} GB")
+            
+            # Adjust batch size based on available memory
+            if free_memory < 1.0:  # Less than 1GB
+                params['batch_size'] = 1
+                print(f"Limited GPU memory detected ({free_memory:.2f} GB). Reduced batch size to 1.")
+            elif free_memory < 2.0:  # Less than 2GB
+                params['batch_size'] = 2
+                print(f"Moderate GPU memory detected ({free_memory:.2f} GB). Using batch size of 2.")
+            else:  # More than 2GB
+                params['batch_size'] = 4
+                print(f"Sufficient GPU memory detected ({free_memory:.2f} GB). Increased batch size to 4.")
+        except Exception as e:
+            print(f"Error adjusting batch size: {e}")
+            # Keep default batch size
+        
+        # Enable pin_memory for faster data transfer to GPU
         params['pin_memory'] = True
         print("pin_memory enabled for DataLoader")
 
@@ -147,17 +208,75 @@ def main():
     # depending on your experiment setup.
 
     try:
-        # Initialize the model with standard parameters
-        model = VideoSWIN3D(
-            num_classes=26,
-            patch_size=(2,4,4),
-            in_chans=3,
-            embed_dim=96,
-            depths=[2, 2, 6, 2],
-            num_heads=[3, 6, 12, 24],
-            window_size=(8,7,7),
-            mlp_ratio=4.
-        )
+        # Choose model size based on available memory
+        if device.type == 'cuda':
+            try:
+                # Get available GPU memory in GB
+                free_memory = (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3
+                
+                # Select model size based on available memory
+                if free_memory < 1.0:  # Less than 1GB
+                    print(f"Limited GPU memory detected ({free_memory:.2f} GB). Using tiny model.")
+                    model = VideoSWIN3D(
+                        num_classes=26,
+                        patch_size=(2,4,4),
+                        in_chans=3,
+                        embed_dim=16,    # minimal embedding dimension
+                        depths=[1, 1, 1, 1],    # minimal depth
+                        num_heads=[1, 1, 1, 1],  # minimal heads
+                        window_size=(8,7,7),
+                        mlp_ratio=4.
+                    )
+                elif free_memory < 2.0:  # Less than 2GB
+                    print(f"Moderate GPU memory detected ({free_memory:.2f} GB). Using small model.")
+                    model = VideoSWIN3D(
+                        num_classes=26,
+                        patch_size=(2,4,4),
+                        in_chans=3,
+                        embed_dim=32,    # reduced embedding dimension
+                        depths=[1, 1, 2, 1],    # shallower network
+                        num_heads=[2, 2, 2, 2],  # fewer attention heads
+                        window_size=(8,7,7),
+                        mlp_ratio=4.
+                    )
+                else:  # More than 2GB
+                    print(f"Sufficient GPU memory detected ({free_memory:.2f} GB). Using standard model.")
+                    model = VideoSWIN3D(
+                        num_classes=26,
+                        patch_size=(2,4,4),
+                        in_chans=3,
+                        embed_dim=96,
+                        depths=[2, 2, 6, 2],
+                        num_heads=[3, 6, 12, 24],
+                        window_size=(8,7,7),
+                        mlp_ratio=4.
+                    )
+            except Exception as e:
+                print(f"Error selecting model size: {e}")
+                # Fall back to small model
+                model = VideoSWIN3D(
+                    num_classes=26,
+                    patch_size=(2,4,4),
+                    in_chans=3,
+                    embed_dim=32,
+                    depths=[1, 1, 2, 1],
+                    num_heads=[2, 2, 2, 2],
+                    window_size=(8,7,7),
+                    mlp_ratio=4.
+                )
+        else:
+            # For CPU, use the smallest model
+            print("Using CPU. Selecting tiny model for better performance.")
+            model = VideoSWIN3D(
+                num_classes=26,
+                patch_size=(2,4,4),
+                in_chans=3,
+                embed_dim=16,
+                depths=[1, 1, 1, 1],
+                num_heads=[1, 1, 1, 1],
+                window_size=(8,7,7),
+                mlp_ratio=4.
+            )
         
         # Try to move model to the selected device, fall back to CPU if there's an error
         try:
@@ -167,7 +286,17 @@ def main():
                 print(f"Error moving model to CUDA: {cuda_err}")
                 print("Falling back to CPU...")
                 device = torch.device("cpu")
-                model = model.to(device)
+                # Use the smallest model for CPU
+                model = VideoSWIN3D(
+                    num_classes=26,
+                    patch_size=(2,4,4),
+                    in_chans=3,
+                    embed_dim=16,
+                    depths=[1, 1, 1, 1],
+                    num_heads=[1, 1, 1, 1],
+                    window_size=(8,7,7),
+                    mlp_ratio=4.
+                ).to(device)
             else:
                 raise  # Re-raise if it's not a CUDA device
     except Exception as e:
@@ -229,11 +358,34 @@ def main():
         lr = 0.02
         wt_decay = 5e-4
         criterion = torch.nn.BCEWithLogitsLoss()
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wt_decay)
+        
+        # Adjust learning rate based on device and model size
+        if device.type == 'cpu':
+            # Lower learning rate for CPU training
+            lr = 0.005
+            print(f"Using reduced learning rate for CPU: {lr}")
+        elif hasattr(model, 'embed_dim') and model.embed_dim < 96:
+            # Lower learning rate for smaller models
+            lr = 0.01
+            print(f"Using reduced learning rate for small model: {lr}")
+        
+        # Use Adam optimizer for better memory efficiency on small GPUs
+        if device.type == 'cuda' and (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3 < 2.0:
+            print("Using Adam optimizer for better memory efficiency")
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wt_decay)
+        else:
+            optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wt_decay)
 
-        # ASAM
-        rho = 0.55
-        eta = 0.01
+        # ASAM with adjusted parameters for memory efficiency
+        if device.type == 'cuda' and (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3 < 1.0:
+            # Use smaller rho for limited memory
+            rho = 0.1
+            eta = 0.01
+            print(f"Using reduced ASAM parameters for limited memory: rho={rho}")
+        else:
+            rho = 0.55
+            eta = 0.01
+        
         minimizer = ASAM(optimizer, model, rho=rho, eta=eta)
     except Exception as e:
         print("Error during loss, optimizer, or ASAM initialization:", str(e))
@@ -256,10 +408,20 @@ def main():
 
             for batch_idx, (inputs, targets) in enumerate(tqdm(training_generator)):
                 try:
+                    # Move data to device
                     inputs = inputs.to(device)
                     targets = targets.to(device)
 
+                    # Clear gradients
                     optimizer.zero_grad()
+
+                    # Free up memory before forward pass
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    
+                    # Use gradient checkpointing to save memory if available
+                    if hasattr(model, 'set_grad_checkpointing'):
+                        model.set_grad_checkpointing(True)
 
                     # Ascent Step
                     predictions = model(inputs.float())
@@ -267,15 +429,31 @@ def main():
                     batch_loss.mean().backward()
                     minimizer.ascent_step()
 
+                    # Free memory after backward pass
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+
                     # Descent Step
                     descent_loss = criterion(model(inputs.float()), targets)
                     descent_loss.mean().backward()
                     minimizer.descent_step()
 
+                    # Calculate metrics on CPU to save GPU memory
                     with torch.no_grad():
                         loss += batch_loss.sum().item()
-                        accuracy += compute_accuracy(predictions, targets, inf_threshold)
+                        # Move predictions to CPU before computing accuracy
+                        accuracy += compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
                     cnt += len(targets)
+                    
+                    # Explicitly delete tensors to free memory
+                    del inputs, targets, predictions, batch_loss, descent_loss
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    
+                    # Periodically run garbage collection
+                    if batch_idx % 10 == 0:
+                        gc.collect()
+                    
                 except RuntimeError as e:
                     if 'out of memory' in str(e):
                         print(f"CUDA out of memory encountered on batch {batch_idx} at epoch {epoch}. Clearing cache, collecting garbage, and printing memory summary.")
@@ -283,6 +461,15 @@ def main():
                             print(torch.cuda.memory_summary(device=device))
                         torch.cuda.empty_cache()
                         gc.collect()
+                        
+                        # Try to reduce batch size dynamically
+                        if params['batch_size'] > 1:
+                            params['batch_size'] = params['batch_size'] // 2
+                            print(f"Reducing batch size to {params['batch_size']} and recreating data loader")
+                            # Recreate data loader with smaller batch size
+                            training_generator = DataLoader(train_dataset, **params)
+                            # Skip to next epoch
+                            break
                         continue
                     else:
                         print(f"Runtime error processing batch {batch_idx} in epoch {epoch}: {str(e)}")
