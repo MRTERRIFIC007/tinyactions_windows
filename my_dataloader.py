@@ -183,13 +183,16 @@ class TinyVIRAT_dataset(Dataset):
     def __init__(self, list_IDs, IDs_path, labels, num_frames=cfg.video_params['num_frames'], input_size=cfg.video_params['height'], frame_by_frame=False, use_augmentation=True, is_training=True, cache_size=64):
         "Initialization"
         self.labels = labels
-        self.list_IDs = list_IDs
         self.IDs_path = IDs_path
         self.num_frames = num_frames
         self.input_size = input_size
         self.frame_by_frame = frame_by_frame
         self.is_training = is_training
-        self.use_augmentation = use_augmentation and is_training
+        self.use_augmentation = use_augmentation
+        
+        # Sort list_IDs for predictable ordering
+        self.list_IDs = sorted(list_IDs)
+        print(f"Dataset initialized with {len(self.list_IDs)} videos in sorted order")
         
         # Initialize video frame cache
         self.cache_size = cache_size
@@ -355,10 +358,9 @@ class TinyVIRAT_dataset(Dataset):
             # Default: treat each video as one sample (build a clip)
             ID = self.list_IDs[index]
             
-            # Only print loading message for the first few videos and then every 1000 videos
-            # This reduces console output while still providing progress information
-            if index < 10 or index % 1000 == 0:
-                print(f"Loading video {index}: {ID}")
+            # Print loading message for every 100 videos in sequential order
+            if index % 100 == 0:
+                print(f"Loading video {index}/{len(self.list_IDs)}: {ID}")
                 
             sample_path = self.IDs_path[ID]
             X = self.build_sample(sample_path)

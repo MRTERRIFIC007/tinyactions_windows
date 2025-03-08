@@ -345,7 +345,7 @@ def main():
         # Set up DataLoader parameters with optimized settings
         params = {
             'batch_size': batch_size,
-            'shuffle': shuffle,
+            'shuffle': False,  # Disable shuffling for predictable loading order
             'num_workers': num_workers,  # Use multiple workers for parallel data loading
             'pin_memory': device.type == 'cuda',  # Only enable for CUDA
             'drop_last': False,  # Process all samples
@@ -353,7 +353,7 @@ def main():
             'persistent_workers': num_workers > 0,  # Keep workers alive between data loader iterations
         }
         
-        print(f"Training parameters: batch_size={batch_size}, num_workers={num_workers}, grad_accumulation={grad_accumulation_steps}, epochs={max_epochs}, early_stopping_patience={early_stopping_patience}, inf_threshold={inf_threshold}")
+        print(f"Training parameters: batch_size={batch_size}, num_workers={num_workers}, shuffle=False, grad_accumulation={grad_accumulation_steps}, epochs={max_epochs}, early_stopping_patience={early_stopping_patience}, inf_threshold={inf_threshold}")
     except Exception as e:
         print("Error during training parameter initialization:", str(e))
         traceback.print_exc()
@@ -459,9 +459,9 @@ def main():
         preload_params['num_workers'] = 1  # Use single worker for deterministic loading
         preload_params['shuffle'] = False  # Load in order
         
-        # Create a small subset of videos to preload (first 100 videos)
-        preload_size = min(100, len(list_IDs))
-        preload_indices = list(range(0, len(list_IDs), len(list_IDs) // preload_size))[:preload_size]
+        # Preload the first 100 videos sequentially
+        preload_size = min(100, len(train_dataset))
+        preload_indices = list(range(preload_size))  # Just the first N videos
         
         # Create a simple progress bar for preloading
         for idx in tqdm(preload_indices, desc="Preloading videos"):
@@ -525,8 +525,8 @@ def main():
             
             # Preload some validation videos
             print("Preloading some validation videos...")
-            val_preload_size = min(50, len(val_list_IDs))
-            val_preload_indices = list(range(0, len(val_list_IDs), len(val_list_IDs) // val_preload_size))[:val_preload_size]
+            val_preload_size = min(50, len(val_dataset))
+            val_preload_indices = list(range(val_preload_size))  # Just the first N validation videos
             for idx in tqdm(val_preload_indices, desc="Preloading validation videos"):
                 _ = val_dataset[idx]
             
