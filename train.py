@@ -15,6 +15,8 @@ import gc
 import time
 import random
 import sys
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 # Import for mixed precision training
 try:
@@ -147,6 +149,107 @@ def get_optimal_device():
         print(f"Error selecting device: {e}")
         print("Falling back to CPU...")
         return torch.device("cpu")
+
+def plot_training_progress(epochs, train_metrics, val_metrics, metric_name, save_path):
+    """
+    Plot training and validation metrics over epochs.
+    
+    Args:
+        epochs: List of epoch numbers
+        train_metrics: List of training metrics
+        val_metrics: List of validation metrics
+        metric_name: Name of the metric (e.g., 'Loss', 'Accuracy')
+        save_path: Path to save the plot
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, train_metrics, 'b-', label=f'Training {metric_name}')
+    if val_metrics:
+        plt.plot(epochs, val_metrics, 'r-', label=f'Validation {metric_name}')
+    
+    plt.title(f'Training and Validation {metric_name} Over Epochs')
+    plt.xlabel('Epochs')
+    plt.ylabel(metric_name)
+    plt.legend()
+    plt.grid(True)
+    
+    # Force x-axis to be integers for epochs
+    ax = plt.gca()
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    
+    # Save the plot
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Saved {metric_name} plot to {save_path}")
+
+def update_training_plots(epoch, train_loss, train_acc, train_f1, val_loss, val_acc, val_f1, path):
+    """
+    Update and save training progress plots after each epoch.
+    
+    Args:
+        epoch: Current epoch number
+        train_loss, train_acc, train_f1: Lists of training metrics
+        val_loss, val_acc, val_f1: Lists of validation metrics
+        path: Directory to save plots
+    """
+    epochs = list(range(1, epoch + 2))  # +2 because epoch is 0-indexed and we want to include current epoch
+    
+    # Plot loss
+    plot_training_progress(
+        epochs, train_loss, val_loss, 'Loss', 
+        os.path.join(path, 'loss_progress.png')
+    )
+    
+    # Plot accuracy
+    plot_training_progress(
+        epochs, train_acc, val_acc, 'Accuracy (%)', 
+        os.path.join(path, 'accuracy_progress.png')
+    )
+    
+    # Plot F1 score
+    plot_training_progress(
+        epochs, train_f1, val_f1, 'F1 Score', 
+        os.path.join(path, 'f1_progress.png')
+    )
+    
+    # Create a combined metrics plot
+    plt.figure(figsize=(12, 10))
+    
+    # Loss subplot
+    plt.subplot(3, 1, 1)
+    plt.plot(epochs, train_loss, 'b-', label='Training Loss')
+    if val_loss:
+        plt.plot(epochs, val_loss, 'r-', label='Validation Loss')
+    plt.title('Training and Validation Loss')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Accuracy subplot
+    plt.subplot(3, 1, 2)
+    plt.plot(epochs, train_acc, 'b-', label='Training Accuracy')
+    if val_acc:
+        plt.plot(epochs, val_acc, 'r-', label='Validation Accuracy')
+    plt.title('Training and Validation Accuracy')
+    plt.ylabel('Accuracy (%)')
+    plt.legend()
+    plt.grid(True)
+    
+    # F1 subplot
+    plt.subplot(3, 1, 3)
+    plt.plot(epochs, train_f1, 'b-', label='Training F1')
+    if val_f1:
+        plt.plot(epochs, val_f1, 'r-', label='Validation F1')
+    plt.title('Training and Validation F1 Score')
+    plt.xlabel('Epochs')
+    plt.ylabel('F1 Score')
+    plt.legend()
+    plt.grid(True)
+    
+    # Adjust layout and save
+    plt.tight_layout()
+    plt.savefig(os.path.join(path, 'combined_metrics.png'))
+    plt.close()
+    print(f"Saved combined metrics plot to {os.path.join(path, 'combined_metrics.png')}")
 
 def main():
     # Set up error logging to file
@@ -1006,6 +1109,14 @@ def main():
             epoch_duration = time.time() - epoch_start_time
             print(f"Epoch {epoch} completed in {epoch_duration:.2f} seconds")
             
+            # Update and save training plots after each epoch
+            update_training_plots(
+                epoch, 
+                epoch_loss_train, epoch_acc_train, epoch_f1_train,
+                epoch_loss_val, epoch_acc_val, epoch_f1_val,
+                PATH
+            )
+            
             # Periodically save checkpoint to prevent complete loss in case of crash
             if epoch % 5 == 0 or epoch == max_epochs - 1:
                 try:
@@ -1190,11 +1301,56 @@ def main():
 
     # Generate and save training plots
     try:
-        print("Generating training plots...")
+        print("Generating final training plots...")
+        # Create traditional line plots
         get_plot(PATH, epoch_acc_train, epoch_acc_val, 'Accuracy-' + exp, 'Train Accuracy', 'Val Accuracy', 'Epochs', 'Acc')
         get_plot(PATH, epoch_loss_train, epoch_loss_val, 'Loss-' + exp, 'Train Loss', 'Val Loss', 'Epochs', 'Loss')
         get_plot(PATH, epoch_f1_train, epoch_f1_val, 'F1-' + exp, 'Train F1', 'Val F1', 'Epochs', 'F1')
-        print("Successfully saved visualization plots.")
+        
+        # Create a final combined plot with all metrics
+        epochs = list(range(1, len(epoch_acc_train) + 1))
+        
+        plt.figure(figsize=(15, 12))
+        
+        # Loss subplot with dual y-axis
+        ax1 = plt.subplot(3, 1, 1)
+        ax1.plot(epochs, epoch_loss_train, 'b-', linewidth=2, label='Train Loss')
+        if epoch_loss_val:
+            ax1.plot(epochs, epoch_loss_val, 'r-', linewidth=2, label='Val Loss')
+        ax1.set_title('Training and Validation Metrics', fontsize=16)
+        ax1.set_ylabel('Loss', fontsize=14)
+        ax1.legend(loc='upper right', fontsize=12)
+        ax1.grid(True)
+        
+        # Accuracy subplot
+        ax2 = plt.subplot(3, 1, 2)
+        ax2.plot(epochs, epoch_acc_train, 'b-', linewidth=2, label='Train Accuracy')
+        if epoch_acc_val:
+            ax2.plot(epochs, epoch_acc_val, 'r-', linewidth=2, label='Val Accuracy')
+        ax2.set_ylabel('Accuracy (%)', fontsize=14)
+        ax2.legend(loc='lower right', fontsize=12)
+        ax2.grid(True)
+        
+        # F1 score subplot
+        ax3 = plt.subplot(3, 1, 3)
+        ax3.plot(epochs, epoch_f1_train, 'b-', linewidth=2, label='Train F1')
+        if epoch_f1_val:
+            ax3.plot(epochs, epoch_f1_val, 'r-', linewidth=2, label='Val F1')
+        ax3.set_xlabel('Epochs', fontsize=14)
+        ax3.set_ylabel('F1 Score', fontsize=14)
+        ax3.legend(loc='lower right', fontsize=12)
+        ax3.grid(True)
+        
+        # Force x-axis to be integers for epochs
+        for ax in [ax1, ax2, ax3]:
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        
+        plt.tight_layout()
+        final_plot_path = os.path.join(PATH, f'final_training_metrics_{exp}.png')
+        plt.savefig(final_plot_path, dpi=300)
+        plt.close()
+        
+        print(f"Successfully saved visualization plots. Final combined plot saved to {final_plot_path}")
     except Exception as plot_e:
         print(f"Error generating plots: {plot_e}")
         traceback.print_exc()
