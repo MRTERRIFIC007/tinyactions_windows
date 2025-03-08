@@ -7,6 +7,39 @@ import config as cfg
 import Preprocessing
 import os
 import random
+import functools
+from concurrent.futures import ThreadPoolExecutor
+import threading
+
+# Add a simple LRU cache for video frames
+class LRUCache:
+    def __init__(self, capacity=32):
+        self.cache = {}
+        self.capacity = capacity
+        self.lock = threading.Lock()
+    
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                # Move to the end to show it was recently used
+                value = self.cache.pop(key)
+                self.cache[key] = value
+                return value
+            return None
+    
+    def put(self, key, value):
+        with self.lock:
+            if key in self.cache:
+                # Remove the existing key
+                self.cache.pop(key)
+            elif len(self.cache) >= self.capacity:
+                # Remove the first item (least recently used)
+                self.cache.pop(next(iter(self.cache)))
+            # Add new key-value pair
+            self.cache[key] = value
+
+# Create a global cache for video frames
+video_frame_cache = LRUCache(capacity=64)  # Cache up to 64 videos
 
 ############ Helper Functions ##############
 def resize(frames, size, interpolation='bilinear'):
@@ -147,7 +180,7 @@ class RandomRotation(object):
 ################# TinyVIRAT Dataset ###################
 class TinyVIRAT_dataset(Dataset):
     'Characterizes a dataset for PyTorch'
-    def __init__(self, list_IDs, IDs_path, labels, num_frames=cfg.video_params['num_frames'], input_size=cfg.video_params['height'], frame_by_frame=False, use_augmentation=True, is_training=True):
+    def __init__(self, list_IDs, IDs_path, labels, num_frames=cfg.video_params['num_frames'], input_size=cfg.video_params['height'], frame_by_frame=False, use_augmentation=True, is_training=True, cache_size=64):
         "Initialization"
         self.labels = labels
         self.list_IDs = list_IDs
@@ -157,6 +190,10 @@ class TinyVIRAT_dataset(Dataset):
         self.frame_by_frame = frame_by_frame
         self.is_training = is_training
         self.use_augmentation = use_augmentation and is_training
+        
+        # Initialize video frame cache
+        self.cache_size = cache_size
+        self.video_frame_cache = video_frame_cache
         
         # Basic transforms
         self.resize = Resize((self.input_size, self.input_size))
@@ -171,6 +208,7 @@ class TinyVIRAT_dataset(Dataset):
                 RandomHorizontalFlip(p=0.5),
                 RandomColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
                 RandomRotation(degrees=10),
+                RandomCrop(size=input_size) if input_size < 120 else Resize(input_size),
                 self.normalize
             ])
         else:
@@ -204,36 +242,68 @@ class TinyVIRAT_dataset(Dataset):
             else:
                 self.frame_index_map = None
 
+    @functools.lru_cache(maxsize=8)  # Cache the last 8 videos loaded
     def load_all_frames(self, video_path):
+        """Load all frames from a video with caching"""
+        # Check if video is in cache
+        cached_frames = self.video_frame_cache.get(video_path)
+        if cached_frames is not None:
+            return cached_frames
+            
+        # If not in cache, load the video
         vidcap = cv2.VideoCapture(video_path)
+        if not vidcap.isOpened():
+            raise ValueError(f"Could not open video file: {video_path}")
+            
         frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
         frame_width = int(vidcap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Pre-allocate numpy array for frames (more efficient than appending)
+        frames = np.empty((frame_count, frame_height, frame_width, 3), dtype=np.uint8)
+        
         ret = True
-        frames = []
-        while ret:
+        frame_idx = 0
+        while ret and frame_idx < frame_count:
             ret, frame = vidcap.read()
             if not ret:
                 break
+            # Convert BGR to RGB
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(frame)
+            frames[frame_idx] = frame
+            frame_idx += 1
+            
         vidcap.release()
-        assert len(frames) == frame_count
-        frames = torch.from_numpy(np.stack(frames))
-        return frames
+        
+        # Adjust if we didn't read all frames
+        if frame_idx < frame_count:
+            frames = frames[:frame_idx]
+            
+        # Convert to tensor
+        frames_tensor = torch.from_numpy(frames)
+        
+        # Store in cache
+        self.video_frame_cache.put(video_path, frames_tensor)
+        
+        return frames_tensor
 
     def build_sample(self, video_path):
+        """Build a sample from a video path with efficient frame handling"""
         frames = self.load_all_frames(video_path)
         count_frames = frames.shape[0]
+        
+        # Handle videos with different frame counts
         if count_frames > self.num_frames:
-            frames = frames[:self.num_frames]
-        elif count_frames < self.num_frames:  # Repeat last frame
-            diff = self.num_frames - count_frames
-            last_frame = frames[-1, :, :, :]
-            tiled = np.tile(last_frame, (diff, 1, 1, 1))
-            frames = np.append(frames, tiled, axis=0)
-        if isinstance(frames, np.ndarray):
-            frames = torch.from_numpy(frames)
+            # Uniformly sample frames if we have more than we need
+            indices = torch.linspace(0, count_frames - 1, self.num_frames).long()
+            frames = frames[indices]
+        elif count_frames < self.num_frames:
+            # Pad with last frame if we have fewer than we need
+            last_frame = frames[-1].unsqueeze(0)  # Add batch dimension
+            padding = last_frame.repeat(self.num_frames - count_frames, 1, 1, 1)
+            frames = torch.cat([frames, padding], dim=0)
+            
+        # Apply transforms
         clips = self.transform(frames)
         return clips
 
@@ -259,16 +329,24 @@ class TinyVIRAT_dataset(Dataset):
             # Frame-by-frame mode for multiple videos.
             vid, frame_num = self.frame_index_map[index]
             video_path = self.IDs_path[vid]
-            cap = cv2.VideoCapture(video_path)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-            ret, frame = cap.read()
-            cap.release()
-            if not ret:
-                raise Exception(f"Could not read frame {frame_num} from video {vid}")
-            # Convert frame from BGR to RGB
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # Convert frame to tensor (H, W, C)
-            frame = torch.from_numpy(frame)
+            
+            # Try to get all frames from cache first
+            cached_frames = self.video_frame_cache.get(video_path)
+            if cached_frames is not None and frame_num < len(cached_frames):
+                frame = cached_frames[frame_num]
+            else:
+                # If not in cache, load just this frame
+                cap = cv2.VideoCapture(video_path)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+                ret, frame = cap.read()
+                cap.release()
+                if not ret:
+                    raise Exception(f"Could not read frame {frame_num} from video {vid}")
+                # Convert frame from BGR to RGB
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Convert frame to tensor
+                frame = torch.from_numpy(frame)
+            
             # Unsqueeze to add temporal dimension: (1, H, W, C)
             frame = frame.unsqueeze(0)
             X = self.transform(frame)
@@ -278,7 +356,7 @@ class TinyVIRAT_dataset(Dataset):
         else:
             # Default: treat each video as one sample (build a clip)
             ID = self.list_IDs[index]
-            if index % 100 == 0:
+            if index % 500 == 0:  # Reduced frequency of logging
                 print(f"Loading video {index}: {ID}")
             sample_path = self.IDs_path[ID]
             X = self.build_sample(sample_path)

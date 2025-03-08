@@ -332,15 +332,28 @@ def main():
         early_stopping_counter = 0
         best_val_metric = 0
         
+        # Determine optimal number of workers for data loading
+        if device.type == 'cpu':
+            # For CPU training, use number of CPU cores minus 2 (to leave resources for the OS and training)
+            num_workers = max(1, multiprocessing.cpu_count() - 2)
+            print(f"Using {num_workers} workers for data loading on CPU")
+        else:
+            # For GPU training, typically 4 workers per GPU is a good starting point
+            num_workers = 4
+            print(f"Using {num_workers} workers for data loading on GPU")
+        
+        # Set up DataLoader parameters with optimized settings
         params = {
             'batch_size': batch_size,
             'shuffle': shuffle,
-            'num_workers': 0,  # Set to 0 to avoid multiprocessing issues
-            'pin_memory': False,  # Disable pin_memory by default to avoid errors
-            'drop_last': False  # Process all samples
+            'num_workers': num_workers,  # Use multiple workers for parallel data loading
+            'pin_memory': device.type == 'cuda',  # Only enable for CUDA
+            'drop_last': False,  # Process all samples
+            'prefetch_factor': 2,  # Prefetch 2 batches per worker (only works when num_workers > 0)
+            'persistent_workers': num_workers > 0,  # Keep workers alive between data loader iterations
         }
         
-        print(f"Training parameters: batch_size={batch_size}, grad_accumulation={grad_accumulation_steps}, epochs={max_epochs}, early_stopping_patience={early_stopping_patience}, inf_threshold={inf_threshold}")
+        print(f"Training parameters: batch_size={batch_size}, num_workers={num_workers}, grad_accumulation={grad_accumulation_steps}, epochs={max_epochs}, early_stopping_patience={early_stopping_patience}, inf_threshold={inf_threshold}")
     except Exception as e:
         print("Error during training parameter initialization:", str(e))
         traceback.print_exc()
