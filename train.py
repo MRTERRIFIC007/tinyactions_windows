@@ -99,9 +99,10 @@ def main():
                   'shuffle': shuffle,
                   'num_workers': 0}  # Set to 0 to avoid multiprocessing issues
 
-        max_epochs = 3
+        # Set epochs to 100 for both CPU and GPU training
+        max_epochs = 100
         inf_threshold = 0.6
-        print(params)
+        print(f"Training parameters: batch_size={params['batch_size']}, epochs={max_epochs}, inf_threshold={inf_threshold}")
     except Exception as e:
         print("Error during training parameter initialization:", str(e))
         traceback.print_exc()
