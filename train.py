@@ -1630,6 +1630,145 @@ def main():
     print(f"Training completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Total training time: {(time.time() - start_time) / 60:.2f} minutes")
     print("TRAINING COMPLETED :)")
+    
+    # Save comprehensive training and testing data to a file
+    try:
+        comprehensive_path = os.path.join(PATH, f"{exp}_comprehensive_results.txt")
+        with open(comprehensive_path, "w") as f:
+            # Header and basic information
+            f.write("=" * 80 + "\n")
+            f.write(f"COMPREHENSIVE TRAINING AND TESTING REPORT\n")
+            f.write(f"Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 80 + "\n\n")
+            
+            # Model configuration
+            f.write("MODEL CONFIGURATION\n")
+            f.write("-" * 50 + "\n")
+            if hasattr(model, 'embed_dim'):
+                f.write(f"Embedding dimension: {model.embed_dim}\n")
+            if hasattr(model, 'depths'):
+                f.write(f"Model depths: {model.depths}\n")
+            if hasattr(model, 'num_heads'):
+                f.write(f"Number of attention heads: {model.num_heads}\n")
+            if hasattr(model, 'window_size'):
+                f.write(f"Window size: {model.window_size}\n")
+            if hasattr(model, 'mlp_ratio'):
+                f.write(f"MLP ratio: {model.mlp_ratio}\n")
+            f.write(f"Device used: {device}\n")
+            f.write("\n")
+            
+            # Training parameters
+            f.write("TRAINING PARAMETERS\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"Total epochs completed: {epoch + 1} out of {max_epochs} maximum\n")
+            f.write(f"Batch size: {batch_size}\n")
+            f.write(f"Gradient accumulation steps: {grad_accumulation_steps}\n")
+            f.write(f"Learning rate: {lr}\n")
+            f.write(f"Weight decay: {wt_decay}\n")
+            f.write(f"Early stopping patience: {early_stopping_patience}\n")
+            f.write(f"Inference threshold: {inf_threshold}\n")
+            f.write(f"Mixed precision training: {'Yes' if use_amp else 'No'}\n")
+            f.write(f"ASAM optimizer: {'Yes' if use_asam else 'No'}\n")
+            if use_asam:
+                f.write(f"ASAM rho: {rho}\n")
+                f.write(f"ASAM eta: {eta}\n")
+            f.write("\n")
+            
+            # Dataset information
+            f.write("DATASET INFORMATION\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"Training samples: {len(train_dataset) if 'train_dataset' in locals() else 'N/A'}\n")
+            f.write(f"Validation samples: {len(val_dataset) if 'val_dataset' in locals() and has_validation else 'N/A'}\n")
+            f.write(f"Test samples: {len(test_dataset) if 'test_dataset' in locals() and test_dataset is not None else 'N/A'}\n")
+            f.write(f"Data augmentation: {'Yes' if 'use_augmentation' in locals() and use_augmentation else 'No'}\n")
+            f.write(f"Mixup augmentation: {'Yes' if 'apply_mixup' in locals() else 'No'}\n")
+            f.write("\n")
+            
+            # Training results
+            f.write("TRAINING RESULTS\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"Best training accuracy: {best_accuracy:.2f}%\n")
+            if has_validation:
+                f.write(f"Best validation accuracy: {best_val_accuracy:.2f}%\n")
+                f.write(f"Best validation F1 score: {best_val_f1:.2f}\n")
+            f.write("\n")
+            
+            # Epoch-by-epoch metrics
+            f.write("EPOCH-BY-EPOCH METRICS\n")
+            f.write("-" * 50 + "\n")
+            f.write("Epoch\tTrain Acc\tTrain Loss\tTrain F1\tVal Acc\tVal Loss\tVal F1\n")
+            for i in range(len(epoch_acc_train)):
+                train_acc = epoch_acc_train[i] if i < len(epoch_acc_train) else "N/A"
+                train_loss = epoch_loss_train[i] if i < len(epoch_loss_train) else "N/A"
+                train_f1 = epoch_f1_train[i] if i < len(epoch_f1_train) else "N/A"
+                val_acc = epoch_acc_val[i] if i < len(epoch_acc_val) else "N/A"
+                val_loss = epoch_loss_val[i] if i < len(epoch_loss_val) else "N/A"
+                val_f1 = epoch_f1_val[i] if i < len(epoch_f1_val) else "N/A"
+                f.write(f"{i}\t{train_acc}\t{train_loss}\t{train_f1}\t{val_acc}\t{val_loss}\t{val_f1}\n")
+            f.write("\n")
+            
+            # Testing results
+            f.write("TESTING RESULTS\n")
+            f.write("-" * 50 + "\n")
+            if 'test_accuracy' in locals() and 'test_cnt' in locals() and test_cnt > 0:
+                f.write(f"Test accuracy: {test_accuracy:.2f}%\n")
+                f.write(f"Test precision: {test_precision:.4f}\n")
+                f.write(f"Test recall: {test_recall:.4f}\n")
+                f.write(f"Test F1 score: {test_f1:.4f}\n")
+                f.write(f"Test loss: {test_loss:.6f}\n")
+                f.write(f"Test samples: {test_cnt}\n")
+                f.write(f"Test batches: {test_batch_count}\n")
+                if 'test_dataset' in locals() and test_dataset is None:
+                    f.write("Note: Testing was performed on training data\n")
+            else:
+                f.write("No testing results available\n")
+            f.write("\n")
+            
+            # Saved model information
+            f.write("SAVED MODEL INFORMATION\n")
+            f.write("-" * 50 + "\n")
+            final_model_path = PATH + exp + '_final_ckpt.pt'
+            best_train_path = PATH + exp + '_best_train_ckpt.pt'
+            best_val_path = PATH + exp + '_best_val_ckpt.pt'
+            compat_path = PATH + exp + "_ckpt.pt"
+            
+            f.write(f"Final model: {final_model_path} (Exists: {os.path.exists(final_model_path)})\n")
+            f.write(f"Best training model: {best_train_path} (Exists: {os.path.exists(best_train_path)})\n")
+            if has_validation:
+                f.write(f"Best validation model: {best_val_path} (Exists: {os.path.exists(best_val_path)})\n")
+            f.write(f"Backward compatible model: {compat_path} (Exists: {os.path.exists(compat_path)})\n")
+            f.write("\n")
+            
+            # Training time information
+            f.write("TIMING INFORMATION\n")
+            f.write("-" * 50 + "\n")
+            total_time = time.time() - start_time
+            f.write(f"Total training time: {total_time/60:.2f} minutes ({total_time:.2f} seconds)\n")
+            if epoch > 0:
+                f.write(f"Average time per epoch: {total_time/(epoch+1)/60:.2f} minutes\n")
+            f.write("\n")
+            
+            # System information
+            f.write("SYSTEM INFORMATION\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"PyTorch version: {torch.__version__}\n")
+            f.write(f"CUDA available: {torch.cuda.is_available()}\n")
+            if torch.cuda.is_available():
+                f.write(f"CUDA version: {torch.version.cuda}\n")
+                f.write(f"GPU device: {torch.cuda.get_device_name(0)}\n")
+                f.write(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB\n")
+            f.write(f"CPU count: {os.cpu_count()}\n")
+            f.write("\n")
+            
+            # Footer
+            f.write("=" * 80 + "\n")
+            f.write("END OF REPORT\n")
+            f.write("=" * 80 + "\n")
+        
+        print(f"Comprehensive training and testing data saved to {comprehensive_path}")
+    except Exception as report_e:
+        print(f"Error saving comprehensive report: {report_e}")
+        traceback.print_exc()
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()
