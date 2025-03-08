@@ -7,7 +7,7 @@ from asam import ASAM
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from utils.visualize import get_plot
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 import os
 import multiprocessing
 import traceback
@@ -29,11 +29,34 @@ if not os.path.exists('exps/exp_' + exp + '/'):
 PATH = 'exps/exp_' + exp + '/'
 
 def compute_accuracy(pred, target, inf_th):
-    target = target.cpu().data.numpy()
-    pred = torch.sigmoid(pred)
-    pred = pred.cpu().data.numpy()
-    pred = pred > inf_th
-    return accuracy_score(pred, target)
+    """Compute accuracy and other metrics with error handling"""
+    try:
+        # Ensure inputs are on CPU and in the right format
+        if isinstance(target, torch.Tensor):
+            target = target.cpu().data.numpy()
+        if isinstance(pred, torch.Tensor):
+            pred = torch.sigmoid(pred)
+            pred = pred.cpu().data.numpy()
+        
+        # Apply threshold
+        pred_binary = pred > inf_th
+        
+        # Calculate metrics
+        accuracy = accuracy_score(target, pred_binary)
+        
+        # Calculate precision, recall, and F1 score
+        try:
+            precision = precision_score(target, pred_binary, average='macro', zero_division=0)
+            recall = recall_score(target, pred_binary, average='macro', zero_division=0)
+            f1 = f1_score(target, pred_binary, average='macro', zero_division=0)
+            return accuracy, precision, recall, f1
+        except Exception as e:
+            print(f"Error calculating precision/recall/F1: {e}")
+            return accuracy, 0.0, 0.0, 0.0
+    except Exception as e:
+        print(f"Error in compute_accuracy: {e}")
+        traceback.print_exc()
+        return 0.0, 0.0, 0.0, 0.0  # Return default values on error
 
 def get_optimal_device():
     """
@@ -444,7 +467,7 @@ def main():
                     with torch.no_grad():
                         loss += batch_loss.sum().item()
                         # Move predictions to CPU before computing accuracy
-                        accuracy += compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
+                        accuracy += compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)[0]
                     cnt += len(targets)
                     
                     # Explicitly delete tensors to free memory
@@ -525,8 +548,13 @@ def main():
         
         # Set model to evaluation mode
         model.eval()
+        
+        # Initialize metrics
         test_loss = 0.
         test_accuracy = 0.
+        test_precision = 0.
+        test_recall = 0.
+        test_f1 = 0.
         cnt = 0.
         successful_batches = 0
         
@@ -596,17 +624,25 @@ def main():
                     # Calculate metrics
                     try:
                         batch_loss = criterion(predictions, targets).sum().item()
-                        batch_accuracy = compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
+                        batch_accuracy, batch_precision, batch_recall, batch_f1 = compute_accuracy(
+                            predictions.detach().cpu(), targets.cpu(), inf_threshold
+                        )
                     except Exception as metric_e:
                         print(f"Error calculating metrics: {metric_e}")
                         traceback.print_exc()
                         # Use default values
                         batch_loss = 0.0
                         batch_accuracy = 0.0
+                        batch_precision = 0.0
+                        batch_recall = 0.0
+                        batch_f1 = 0.0
                     
                     # Update counters
                     test_loss += batch_loss
                     test_accuracy += batch_accuracy
+                    test_precision += batch_precision
+                    test_recall += batch_recall
+                    test_f1 += batch_f1
                     cnt += len(targets)
                     successful_batches += 1
                     
@@ -648,6 +684,9 @@ def main():
                                 # Restart testing
                                 test_loss = 0.
                                 test_accuracy = 0.
+                                test_precision = 0.
+                                test_recall = 0.
+                                test_f1 = 0.
                                 cnt = 0.
                                 successful_batches = 0
                                 break
@@ -670,19 +709,41 @@ def main():
                 if cnt > 0:
                     test_loss /= cnt
                     test_accuracy /= successful_batches
-                    print(f"Test metrics - Accuracy: {test_accuracy:6.2f} %, Loss: {test_loss:8.5f}")
-                    print(f"Successfully processed {cnt} samples in {successful_batches} batches")
+                    test_precision /= successful_batches
+                    test_recall /= successful_batches
+                    test_f1 /= successful_batches
+                    
+                    # Print detailed test results
+                    print("\n" + "="*50)
+                    print("FINAL TEST RESULTS")
+                    print("="*50)
+                    print(f"Accuracy:  {test_accuracy*100:6.2f}%")
+                    print(f"Precision: {test_precision:6.4f}")
+                    print(f"Recall:    {test_recall:6.4f}")
+                    print(f"F1 Score:  {test_f1:6.4f}")
+                    print(f"Loss:      {test_loss:8.5f}")
+                    print(f"Samples:   {cnt}")
+                    print(f"Batches:   {successful_batches}")
+                    print("="*50)
                     
                     # Save results to a file
                     try:
-                        with open(PATH + "test_results.txt", "w") as f:
+                        results_file = os.path.join(PATH, "test_results.txt")
+                        with open(results_file, "w") as f:
+                            f.write("="*50 + "\n")
+                            f.write("FINAL TEST RESULTS\n")
+                            f.write("="*50 + "\n")
                             f.write(f"Model: {exp}_ckpt.pt\n")
-                            f.write(f"Accuracy: {test_accuracy:6.2f} %\n")
-                            f.write(f"Loss: {test_loss:8.5f}\n")
-                            f.write(f"Samples: {cnt}\n")
-                            f.write(f"Batches: {successful_batches}\n")
-                            f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                        print(f"Test results saved to {PATH}test_results.txt")
+                            f.write(f"Accuracy:  {test_accuracy*100:6.2f}%\n")
+                            f.write(f"Precision: {test_precision:6.4f}\n")
+                            f.write(f"Recall:    {test_recall:6.4f}\n")
+                            f.write(f"F1 Score:  {test_f1:6.4f}\n")
+                            f.write(f"Loss:      {test_loss:8.5f}\n")
+                            f.write(f"Samples:   {cnt}\n")
+                            f.write(f"Batches:   {successful_batches}\n")
+                            f.write(f"Date:      {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                            f.write("="*50 + "\n")
+                        print(f"Test results saved to {results_file}")
                     except Exception as save_e:
                         print(f"Error saving results: {save_e}")
                 else:
@@ -710,6 +771,20 @@ def main():
             torch.cuda.empty_cache()
         gc.collect()
         print("Testing phase completed.")
+        
+        # Print training summary
+        print("\n" + "="*50)
+        print("TRAINING SUMMARY")
+        print("="*50)
+        print(f"Total epochs completed: {epoch + 1}")
+        print(f"Best training accuracy: {best_accuracy*100:6.2f}%")
+        if 'has_validation' in locals() and has_validation:
+            print(f"Best validation accuracy: {best_val_accuracy*100:6.2f}%")
+        print(f"Final test accuracy: {test_accuracy*100:6.2f}%")
+        print(f"Final test F1 score: {test_f1:6.4f}")
+        print(f"Training completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Total training time: {(time.time() - start_time) / 60:.2f} minutes")
+        print("="*50)
 
     try:
         # Save visualization
