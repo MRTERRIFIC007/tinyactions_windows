@@ -45,7 +45,7 @@ def timeout(seconds=10, error_message="Operation timed out"):
     return decorator
 
 def compute_accuracy(pred, target, inf_th):
-    """Compute accuracy with error handling"""
+    """Compute accuracy and other metrics with error handling"""
     try:
         # Ensure inputs are on CPU and in the right format
         if isinstance(target, torch.Tensor):
@@ -60,13 +60,29 @@ def compute_accuracy(pred, target, inf_th):
         # Handle edge cases
         if len(target) == 0 or len(pred_binary) == 0:
             print("Warning: Empty prediction or target array")
-            return 0.0
+            return 0.0, 0.0, 0.0, 0.0
+        
+        # Calculate metrics
+        accuracy = accuracy_score(target, pred_binary)
+        
+        # Calculate precision, recall, and F1 score
+        try:
+            from sklearn.metrics import precision_score, recall_score, f1_score
             
-        return accuracy_score(pred_binary, target)
+            # Handle potential warnings for classes with no samples
+            precision = precision_score(target, pred_binary, average='macro', zero_division=0)
+            recall = recall_score(target, pred_binary, average='macro', zero_division=0)
+            f1 = f1_score(target, pred_binary, average='macro', zero_division=0)
+            
+            return accuracy, precision, recall, f1
+        except Exception as metric_e:
+            print(f"Error calculating precision/recall/F1: {metric_e}")
+            return accuracy, 0.0, 0.0, 0.0
+            
     except Exception as e:
         print(f"Error in compute_accuracy: {e}")
         traceback.print_exc()
-        return 0.0  # Return a default value on error
+        return 0.0, 0.0, 0.0, 0.0  # Return default values on error
 
 def get_optimal_device():
     """
@@ -275,6 +291,9 @@ def test_model(model_path, data_path=None, batch_size=2, inf_threshold=0.6):
     original_sigint = signal.getsignal(signal.SIGINT)
     original_sigterm = signal.getsignal(signal.SIGTERM)
     
+    # Start timing
+    start_time = time.time()
+    
     def signal_handler(sig, frame):
         print(f"\nReceived signal {sig}. Cleaning up and exiting gracefully...")
         # Restore original signal handlers
@@ -292,6 +311,16 @@ def test_model(model_path, data_path=None, batch_size=2, inf_threshold=0.6):
     # Set up signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Create a results directory if it doesn't exist
+    results_dir = "test_results"
+    try:
+        if not os.path.exists(results_dir):
+            os.makedirs(results_dir)
+        print(f"Results will be saved to {results_dir} directory")
+    except Exception as dir_e:
+        print(f"Error creating results directory: {dir_e}")
+        results_dir = "."  # Use current directory as fallback
     
     try:
         # Start with a clean slate
@@ -508,8 +537,17 @@ def test_model(model_path, data_path=None, batch_size=2, inf_threshold=0.6):
         print("Starting testing...")
         test_loss = 0.
         test_accuracy = 0.
+        test_precision = 0.
+        test_recall = 0.
+        test_f1 = 0.
         cnt = 0.
         successful_batches = 0
+        
+        # Store per-class metrics
+        class_correct = np.zeros(26)
+        class_total = np.zeros(26)
+        all_predictions = []
+        all_targets = []
         
         # Set a timeout for the entire testing process
         start_time = time.time()
@@ -539,12 +577,23 @@ def test_model(model_path, data_path=None, batch_size=2, inf_threshold=0.6):
                         
                         # Calculate metrics
                         batch_loss = criterion(predictions, targets).mean(dim=1).sum().item()
-                        batch_accuracy = compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
+                        batch_accuracy, batch_precision, batch_recall, batch_f1 = compute_accuracy(
+                            predictions.detach().cpu(), targets.cpu(), inf_threshold
+                        )
+                        
+                        # Store predictions and targets for later analysis
+                        nonlocal all_predictions, all_targets
+                        pred_binary = (torch.sigmoid(predictions.detach().cpu()) > inf_threshold).float()
+                        all_predictions.append(pred_binary)
+                        all_targets.append(targets.cpu())
                         
                         # Update counters
-                        nonlocal test_loss, test_accuracy, cnt, successful_batches
+                        nonlocal test_loss, test_accuracy, test_precision, test_recall, test_f1, cnt, successful_batches
                         test_loss += batch_loss
                         test_accuracy += batch_accuracy
+                        test_precision += batch_precision
+                        test_recall += batch_recall
+                        test_f1 += batch_f1
                         cnt += len(targets)
                         successful_batches += 1
                         
@@ -564,7 +613,7 @@ def test_model(model_path, data_path=None, batch_size=2, inf_threshold=0.6):
                     # Periodically run garbage collection
                     if test_batch_idx % 5 == 0:
                         gc.collect()
-                        
+                    
                 except RuntimeError as e:
                     if 'out of memory' in str(e):
                         print(f"CUDA out of memory encountered on test batch {test_batch_idx}. Clearing cache and trying to continue...")
@@ -584,9 +633,14 @@ def test_model(model_path, data_path=None, batch_size=2, inf_threshold=0.6):
                                 targets = targets.to(device)
                                 predictions = model(inputs.float())
                                 batch_loss = criterion(predictions, targets).mean(dim=1).sum().item()
-                                batch_accuracy = compute_accuracy(predictions.detach(), targets, inf_threshold)
+                                batch_accuracy, batch_precision, batch_recall, batch_f1 = compute_accuracy(
+                                    predictions.detach(), targets, inf_threshold
+                                )
                                 test_loss += batch_loss
                                 test_accuracy += batch_accuracy
+                                test_precision += batch_precision
+                                test_recall += batch_recall
+                                test_f1 += batch_f1
                                 cnt += len(targets)
                                 successful_batches += 1
                                 continue
@@ -601,6 +655,9 @@ def test_model(model_path, data_path=None, batch_size=2, inf_threshold=0.6):
                                 # Restart testing
                                 test_loss = 0.
                                 test_accuracy = 0.
+                                test_precision = 0.
+                                test_recall = 0.
+                                test_f1 = 0.
                                 cnt = 0.
                                 successful_batches = 0
                                 break
@@ -623,22 +680,83 @@ def test_model(model_path, data_path=None, batch_size=2, inf_threshold=0.6):
                 if cnt > 0:
                     test_loss /= cnt
                     test_accuracy /= successful_batches
-                    print(f"Test metrics - Accuracy: {test_accuracy:6.2f} %, Loss: {test_loss:8.5f}")
-                    print(f"Successfully processed {cnt} samples in {successful_batches} batches")
+                    test_precision /= successful_batches
+                    test_recall /= successful_batches
+                    test_f1 /= successful_batches
                     
-                    # Save results to a file
+                    # Print detailed metrics
+                    print("\n" + "="*50)
+                    print("TEST RESULTS SUMMARY")
+                    print("="*50)
+                    print(f"Accuracy:  {test_accuracy:6.2f} %")
+                    print(f"Precision: {test_precision:6.2f}")
+                    print(f"Recall:    {test_recall:6.2f}")
+                    print(f"F1 Score:  {test_f1:6.2f}")
+                    print(f"Loss:      {test_loss:8.5f}")
+                    print(f"Samples:   {cnt}")
+                    print(f"Batches:   {successful_batches}")
+                    print("="*50)
+                    
+                    # Generate timestamp for unique filenames
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    
+                    # Save detailed results to a file
                     try:
-                        with open("test_results.txt", "w") as f:
+                        results_file = os.path.join(results_dir, f"test_results_{timestamp}.txt")
+                        with open(results_file, "w") as f:
+                            f.write("="*50 + "\n")
+                            f.write("TEST RESULTS SUMMARY\n")
+                            f.write("="*50 + "\n")
                             f.write(f"Model: {model_path}\n")
                             f.write(f"Data: {data_path}\n")
-                            f.write(f"Accuracy: {test_accuracy:6.2f} %\n")
-                            f.write(f"Loss: {test_loss:8.5f}\n")
-                            f.write(f"Samples: {cnt}\n")
-                            f.write(f"Batches: {successful_batches}\n")
-                            f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                        print("Test results saved to test_results.txt")
+                            f.write(f"Device: {device}\n")
+                            f.write(f"Inference threshold: {inf_threshold}\n")
+                            f.write(f"Batch size: {batch_size}\n")
+                            f.write("\n")
+                            f.write(f"Accuracy:  {test_accuracy:6.2f} %\n")
+                            f.write(f"Precision: {test_precision:6.2f}\n")
+                            f.write(f"Recall:    {test_recall:6.2f}\n")
+                            f.write(f"F1 Score:  {test_f1:6.2f}\n")
+                            f.write(f"Loss:      {test_loss:8.5f}\n")
+                            f.write(f"Samples:   {cnt}\n")
+                            f.write(f"Batches:   {successful_batches}\n")
+                            f.write(f"Test date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                            f.write(f"Test duration: {(time.time() - start_time)/60:.2f} minutes\n")
+                            f.write("="*50 + "\n\n")
+                            
+                            # Try to calculate per-class metrics
+                            try:
+                                if len(all_predictions) > 0 and len(all_targets) > 0:
+                                    # Concatenate all predictions and targets
+                                    all_pred_tensor = torch.cat(all_predictions, dim=0).numpy()
+                                    all_target_tensor = torch.cat(all_targets, dim=0).numpy()
+                                    
+                                    # Calculate per-class metrics
+                                    from sklearn.metrics import precision_recall_fscore_support
+                                    precision_per_class, recall_per_class, f1_per_class, support_per_class = \
+                                        precision_recall_fscore_support(all_target_tensor, all_pred_tensor, 
+                                                                        average=None, zero_division=0)
+                                    
+                                    # Write per-class metrics
+                                    f.write("PER-CLASS METRICS\n")
+                                    f.write("="*50 + "\n")
+                                    f.write("Class\tPrecision\tRecall\t\tF1\t\tSupport\n")
+                                    for i in range(len(precision_per_class)):
+                                        f.write(f"{i}\t{precision_per_class[i]:.4f}\t\t{recall_per_class[i]:.4f}\t\t{f1_per_class[i]:.4f}\t\t{support_per_class[i]}\n")
+                            except Exception as per_class_e:
+                                f.write(f"Error calculating per-class metrics: {per_class_e}\n")
+                        
+                        print(f"Detailed test results saved to {results_file}")
+                        
+                        # Create a summary file that's always overwritten with the latest results
+                        summary_file = os.path.join(results_dir, "latest_test_results.txt")
+                        import shutil
+                        shutil.copy2(results_file, summary_file)
+                        print(f"Latest results also saved to {summary_file}")
+                        
                     except Exception as save_e:
-                        print(f"Error saving results: {save_e}")
+                        print(f"Error saving detailed results: {save_e}")
+                        traceback.print_exc()
                 else:
                     print("No test samples were successfully processed. Testing failed.")
             else:
