@@ -6,16 +6,31 @@ import os
 script_dir = os.path.dirname(os.path.abspath(__file__))
 default_base_dir = os.path.join(script_dir, 'TinyVIRAT_V2')
 
+# Additional possible dataset locations
+additional_dataset_paths = [
+    '/workspace/TinyVIRAT_V2',  # Specified path
+    '/workspace/tinyactions_2/tinyactions_windows/TinyVIRAT_V2',
+    '/workspace/Tinyactions/TinyActions wins/TinyVIRAT_V2',
+]
+
 # If we're already in a TinyVIRAT_V2 directory, use the parent directory
 if os.path.basename(script_dir) == 'TinyVIRAT_V2':
     default_base_dir = script_dir
 
+# Try to find the dataset in the additional paths
 BASE_DIR = os.environ.get('TINYACTIONS_DATA_DIR', default_base_dir)
 
-# Check if the directory exists, if not, use the current directory as fallback
+# Check if the directory exists, if not, try the additional paths
 if not os.path.exists(BASE_DIR):
-    print(f"Warning: Directory {BASE_DIR} not found. Using current directory as fallback.")
-    BASE_DIR = script_dir
+    print(f"Warning: Directory {BASE_DIR} not found. Checking alternative locations...")
+    for path in additional_dataset_paths:
+        if os.path.exists(path):
+            BASE_DIR = path
+            print(f"Found dataset at {BASE_DIR}")
+            break
+    else:  # This else belongs to the for loop, executes if no break occurred
+        print(f"Warning: Dataset not found in any of the expected locations. Using current directory as fallback.")
+        BASE_DIR = script_dir
 
 video_params = {
     "width": 120,
