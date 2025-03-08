@@ -122,7 +122,12 @@ def get_optimal_device():
             except RuntimeError as e:
                 print(f"Error with GPU: {e}")
                 print("Falling back to CPU...")
-                return torch.device("cpu")
+                device = torch.device("cpu")
+                # Update epochs for CPU training
+                max_epochs = 100
+                early_stopping_patience = 15
+                print(f"Updated to CPU training with {max_epochs} epochs and {early_stopping_patience} early stopping patience")
+                return device
         
         # Multiple GPUs available, find the one with most free memory
         free_memory = []
@@ -295,18 +300,35 @@ def main():
         else:
             grad_accumulation_steps = 1
         
-        # Increase epochs for CPU training to compensate for smaller model
-        if not torch.cuda.is_available():
-            max_epochs = 100  # More epochs for CPU training (increased from 25 to 100)
-        else:
-            # Increase GPU epochs as well for better accuracy
-            if torch.cuda.get_device_properties(0).total_memory / 1024**3 < 4:
-                max_epochs = 15  # For GPUs with less than 4GB memory (increased from 10)
-            else:
-                max_epochs = 20  # For GPUs with more memory (increased from 15)
+        # Set threshold for binary classification
+        inf_threshold = 0.5  # Reduced from 0.6 for better recall
         
-        # Add early stopping to prevent overfitting
-        early_stopping_patience = 15 if not torch.cuda.is_available() else 7  # Increased for CPU training with more epochs
+        # Get the optimal device first, before setting epochs
+        device = get_optimal_device()
+        
+        # Set epochs based on the actual device that will be used
+        if device.type == 'cpu':
+            max_epochs = 100  # More epochs for CPU training
+            early_stopping_patience = 15  # Increased patience for CPU training
+            print(f"Using CPU training with {max_epochs} epochs and {early_stopping_patience} early stopping patience")
+        else:
+            # GPU training
+            try:
+                gpu_memory = torch.cuda.get_device_properties(device).total_memory / 1024**3
+                if gpu_memory < 4:
+                    max_epochs = 15  # For GPUs with less than 4GB memory
+                    early_stopping_patience = 7
+                    print(f"Using GPU training with limited memory ({gpu_memory:.2f} GB). Setting {max_epochs} epochs.")
+                else:
+                    max_epochs = 20  # For GPUs with more memory
+                    early_stopping_patience = 7
+                    print(f"Using GPU training with sufficient memory ({gpu_memory:.2f} GB). Setting {max_epochs} epochs.")
+            except Exception as e:
+                print(f"Error determining GPU memory: {e}")
+                max_epochs = 15  # Conservative default
+                early_stopping_patience = 7
+                print(f"Using default GPU training with {max_epochs} epochs.")
+        
         early_stopping_counter = 0
         best_val_metric = 0
         
@@ -318,9 +340,6 @@ def main():
             'drop_last': False  # Process all samples
         }
         
-        # Set threshold for binary classification
-        inf_threshold = 0.5  # Reduced from 0.6 for better recall
-        
         print(f"Training parameters: batch_size={batch_size}, grad_accumulation={grad_accumulation_steps}, epochs={max_epochs}, early_stopping_patience={early_stopping_patience}, inf_threshold={inf_threshold}")
     except Exception as e:
         print("Error during training parameter initialization:", str(e))
@@ -330,9 +349,6 @@ def main():
             sys.stderr = sys.__stderr__
         return
 
-    # Get the optimal device
-    device = get_optimal_device()
-    
     # Set up mixed precision training if available
     use_amp = AMP_AVAILABLE and device.type == 'cuda'
     if use_amp:
@@ -578,6 +594,10 @@ def main():
                 print(f"Error moving model to CUDA: {cuda_err}")
                 print("Falling back to CPU...")
                 device = torch.device("cpu")
+                # Update epochs for CPU training
+                max_epochs = 100
+                early_stopping_patience = 15
+                print(f"Updated to CPU training with {max_epochs} epochs and {early_stopping_patience} early stopping patience")
                 # Use the smallest model for CPU
                 model = VideoSWIN3D(
                     num_classes=26,
@@ -609,19 +629,43 @@ def main():
             
             # Try to move model to the selected device, fall back to CPU if there's an error
             try:
-                model = model.to(device)
-            except RuntimeError as cuda_err:
                 if device.type == 'cuda':
                     print(f"Error moving smaller model to CUDA: {cuda_err}")
                     print("Falling back to CPU...")
                     device = torch.device("cpu")
+                    # Update epochs for CPU training
+                    max_epochs = 100
+                    early_stopping_patience = 15
+                    print(f"Updated to CPU training with {max_epochs} epochs and {early_stopping_patience} early stopping patience")
                     model = model.to(device)
                 else:
                     raise  # Re-raise if it's not a CUDA device
+            except Exception as e2:
+                print(f"Error initializing smaller model: {e2}")
+                print("Falling back to CPU with minimal model...")
+                device = torch.device("cpu")
+                # Update epochs for CPU training
+                max_epochs = 100
+                early_stopping_patience = 15
+                print(f"Updated to CPU training with {max_epochs} epochs and {early_stopping_patience} early stopping patience")
+                model = VideoSWIN3D(
+                    num_classes=26,
+                    patch_size=(2,4,4),
+                    in_chans=3,
+                    embed_dim=16,    # minimal embedding dimension
+                    depths=[1, 1, 1, 1],    # minimal depth
+                    num_heads=[1, 1, 1, 1],  # minimal heads
+                    window_size=(8,7,7),
+                    mlp_ratio=4.
+                ).to(device)
         except Exception as e2:
             print(f"Error initializing smaller model: {e2}")
             print("Falling back to CPU with minimal model...")
             device = torch.device("cpu")
+            # Update epochs for CPU training
+            max_epochs = 100
+            early_stopping_patience = 15
+            print(f"Updated to CPU training with {max_epochs} epochs and {early_stopping_patience} early stopping patience")
             model = VideoSWIN3D(
                 num_classes=26,
                 patch_size=(2,4,4),
