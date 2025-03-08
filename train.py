@@ -7,13 +7,14 @@ from asam import ASAM
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from utils.visualize import get_plot
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import os
 import multiprocessing
 import traceback
 import gc
 import time
 import random
+import sys
 
 # Import for mixed precision training
 try:
@@ -30,6 +31,22 @@ if torch.cuda.is_available():
 
 import config as cfg
 
+# Set random seeds for reproducibility
+def set_seed(seed=42):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+# Set seeds for reproducibility
+set_seed(42)
+
 exp = '23'
 
 # Make exp dir
@@ -38,11 +55,43 @@ if not os.path.exists('exps/exp_' + exp + '/'):
 PATH = 'exps/exp_' + exp + '/'
 
 def compute_accuracy(pred, target, inf_th):
-    target = target.cpu().data.numpy()
-    pred = torch.sigmoid(pred)
-    pred = pred.cpu().data.numpy()
-    pred = pred > inf_th
-    return accuracy_score(pred, target)
+    """
+    Compute accuracy with error handling and additional metrics.
+    Returns accuracy, precision, recall, and F1 score.
+    """
+    try:
+        # Ensure inputs are on CPU and in the right format
+        if isinstance(target, torch.Tensor):
+            target = target.cpu().data.numpy()
+        if isinstance(pred, torch.Tensor):
+            pred = torch.sigmoid(pred)
+            pred = pred.cpu().data.numpy()
+        
+        # Apply threshold
+        pred_binary = pred > inf_th
+        
+        # Handle edge cases
+        if len(target) == 0 or len(pred_binary) == 0:
+            print("Warning: Empty prediction or target array")
+            return 0.0, 0.0, 0.0, 0.0
+        
+        # Calculate accuracy
+        acc = accuracy_score(target, pred_binary)
+        
+        # Calculate precision, recall, and F1 score (macro average)
+        try:
+            precision, recall, f1, _ = precision_recall_fscore_support(
+                target, pred_binary, average='macro', zero_division=0
+            )
+        except Exception as e:
+            print(f"Error calculating precision/recall: {e}")
+            precision, recall, f1 = 0.0, 0.0, 0.0
+            
+        return acc, precision, recall, f1
+    except Exception as e:
+        print(f"Error in compute_accuracy: {e}")
+        traceback.print_exc()
+        return 0.0, 0.0, 0.0, 0.0  # Return default values on error
 
 def get_optimal_device():
     """
@@ -100,6 +149,17 @@ def get_optimal_device():
         return torch.device("cpu")
 
 def main():
+    # Set up error logging to file
+    error_log_path = os.path.join(PATH, "error_log.txt")
+    try:
+        error_log = open(error_log_path, "w")
+        # Redirect stderr to the error log file
+        sys.stderr = error_log
+        print(f"Redirecting error logs to {error_log_path}")
+    except Exception as e:
+        print(f"Could not set up error logging: {e}")
+        error_log = None
+    
     try:
         # Training Parameters
         shuffle = True
@@ -134,30 +194,37 @@ def main():
         
         # Increase epochs for CPU training to compensate for smaller model
         if not torch.cuda.is_available():
-            max_epochs = 20  # More epochs for CPU training (increased from 10)
+            max_epochs = 25  # More epochs for CPU training (increased from 20)
         else:
             # Increase GPU epochs as well for better accuracy
             if torch.cuda.get_device_properties(0).total_memory / 1024**3 < 4:
-                max_epochs = 10  # For GPUs with less than 4GB memory
+                max_epochs = 15  # For GPUs with less than 4GB memory (increased from 10)
             else:
-                max_epochs = 15  # For GPUs with more memory
+                max_epochs = 20  # For GPUs with more memory (increased from 15)
         
         # Add early stopping to prevent overfitting
-        early_stopping_patience = 5
+        early_stopping_patience = 7  # Increased from 5 for more training opportunity
         early_stopping_counter = 0
         best_val_metric = 0
         
         params = {
             'batch_size': batch_size,
             'shuffle': shuffle,
-            'num_workers': 0  # Set to 0 to avoid multiprocessing issues
+            'num_workers': 0,  # Set to 0 to avoid multiprocessing issues
+            'pin_memory': torch.cuda.is_available(),  # Enable pin_memory if CUDA is available
+            'drop_last': False  # Process all samples
         }
         
-        inf_threshold = 0.6
-        print(f"Training parameters: batch_size={batch_size}, grad_accumulation={grad_accumulation_steps}, epochs={max_epochs}, early_stopping_patience={early_stopping_patience}")
+        # Set threshold for binary classification
+        inf_threshold = 0.5  # Reduced from 0.6 for better recall
+        
+        print(f"Training parameters: batch_size={batch_size}, grad_accumulation={grad_accumulation_steps}, epochs={max_epochs}, early_stopping_patience={early_stopping_patience}, inf_threshold={inf_threshold}")
     except Exception as e:
         print("Error during training parameter initialization:", str(e))
         traceback.print_exc()
+        if error_log:
+            error_log.close()
+            sys.stderr = sys.__stderr__
         return
 
     # Get the optimal device
@@ -250,12 +317,43 @@ def main():
         
         # Create a validation set (20% of training data)
         if len(list_IDs) > 5:  # Only if we have enough data
-            val_size = max(1, int(len(list_IDs) * 0.2))
-            train_size = len(list_IDs) - val_size
-            
-            # Split the data
-            train_list_IDs = list_IDs[:train_size]
-            val_list_IDs = list_IDs[train_size:]
+            # Use stratified split if possible to maintain class distribution
+            try:
+                from sklearn.model_selection import train_test_split
+                
+                # Convert labels to format suitable for stratified split
+                label_indices = {}
+                for i, id in enumerate(list_IDs):
+                    # Use the first non-zero label as the class
+                    label = labels[id]
+                    label_idx = next((i for i, x in enumerate(label) if x > 0), 0)
+                    label_indices[id] = label_idx
+                
+                # Get unique labels
+                unique_labels = set(label_indices.values())
+                
+                if len(unique_labels) > 1:
+                    # Use stratified split
+                    print("Using stratified split for validation set")
+                    train_list_IDs, val_list_IDs = train_test_split(
+                        list_IDs, 
+                        test_size=0.2, 
+                        random_state=42,
+                        stratify=[label_indices[id] for id in list_IDs]
+                    )
+                else:
+                    # Fall back to random split
+                    print("Using random split for validation set (only one class detected)")
+                    val_size = max(1, int(len(list_IDs) * 0.2))
+                    train_size = len(list_IDs) - val_size
+                    train_list_IDs = list_IDs[:train_size]
+                    val_list_IDs = list_IDs[train_size:]
+            except Exception as e:
+                print(f"Error creating stratified split: {e}. Using random split.")
+                val_size = max(1, int(len(list_IDs) * 0.2))
+                train_size = len(list_IDs) - val_size
+                train_list_IDs = list_IDs[:train_size]
+                val_list_IDs = list_IDs[train_size:]
             
             # Create validation dataset and dataloader (no augmentation for validation)
             val_dataset = TinyVIRAT_dataset(
@@ -352,7 +450,7 @@ def main():
                     mlp_ratio=4.
                 )
         else:
-            # For CPU, use the smallest model but with more width
+            # For CPU, use optimized model with efficient attention
             print("Using CPU. Selecting optimized model for CPU training.")
             model = VideoSWIN3D(
                 num_classes=26,
@@ -514,7 +612,7 @@ def main():
                 optimizer, mode='max', factor=0.5, patience=2, verbose=True
             )
             use_plateau_scheduler = True
-
+        
         # ASAM with adjusted parameters for memory efficiency
         if device.type == 'cuda' and (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3 < 1.0:
             # Use smaller rho for limited memory
@@ -536,23 +634,58 @@ def main():
     except Exception as e:
         print("Error during loss, optimizer, or ASAM initialization:", str(e))
         traceback.print_exc()
+        if error_log:
+            error_log.close()
+            sys.stderr = sys.__stderr__
         return
 
     # Training and validation loops
     epoch_loss_train = []
     epoch_acc_train = []
+    epoch_f1_train = []
     epoch_loss_val = []
     epoch_acc_val = []
+    epoch_f1_val = []
 
     best_accuracy = 0.
     best_val_accuracy = 0.
+    best_val_f1 = 0.
     print("Begin Training....")
+    
+    # Save training configuration for reproducibility
+    try:
+        config_path = os.path.join(PATH, "training_config.txt")
+        with open(config_path, "w") as config_file:
+            config_file.write(f"Device: {device}\n")
+            config_file.write(f"Batch size: {batch_size}\n")
+            config_file.write(f"Gradient accumulation steps: {grad_accumulation_steps}\n")
+            config_file.write(f"Max epochs: {max_epochs}\n")
+            config_file.write(f"Early stopping patience: {early_stopping_patience}\n")
+            config_file.write(f"Inference threshold: {inf_threshold}\n")
+            config_file.write(f"Learning rate: {lr}\n")
+            config_file.write(f"Weight decay: {wt_decay}\n")
+            config_file.write(f"Model embed_dim: {model.embed_dim if hasattr(model, 'embed_dim') else 'N/A'}\n")
+            config_file.write(f"Use ASAM: {use_asam}\n")
+            config_file.write(f"Use AMP: {use_amp}\n")
+            config_file.write(f"Training samples: {len(train_dataset) if 'train_dataset' in locals() else 'N/A'}\n")
+            config_file.write(f"Validation samples: {len(val_dataset) if 'val_dataset' in locals() and has_validation else 'N/A'}\n")
+            config_file.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        print(f"Saved training configuration to {config_path}")
+    except Exception as e:
+        print(f"Error saving training configuration: {e}")
+    
+    # Training loop with error handling
     for epoch in range(max_epochs):
         try:
+            epoch_start_time = time.time()
+            
             # Train
             model.train()
             loss = 0.
             accuracy = 0.
+            precision = 0.
+            recall = 0.
+            f1 = 0.
             cnt = 0.
             batch_count = 0
 
@@ -667,8 +800,12 @@ def main():
                     # Calculate metrics on CPU to save GPU memory
                     with torch.no_grad():
                         loss += batch_loss.sum().item() * grad_accumulation_steps
-                        # Move predictions to CPU before computing accuracy
-                        accuracy += compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
+                        # Calculate accuracy, precision, recall, and F1 score
+                        acc, prec, rec, f1_score = compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
+                        accuracy += acc
+                        precision += prec
+                        recall += rec
+                        f1 += f1_score
                     cnt += len(targets)
                     batch_count += 1
                     
@@ -676,6 +813,8 @@ def main():
                     del inputs, targets, predictions, batch_loss
                     if 'descent_loss' in locals():
                         del descent_loss
+                    if 'descent_predictions' in locals():
+                        del descent_predictions
                     if device.type == 'cuda':
                         torch.cuda.empty_cache()
                     
@@ -699,7 +838,6 @@ def main():
                             training_generator = DataLoader(train_dataset, **params)
                             # Skip to next epoch
                             break
-                        continue
                     else:
                         print(f"Runtime error processing batch {batch_idx} in epoch {epoch}: {str(e)}")
                         traceback.print_exc()
@@ -713,375 +851,360 @@ def main():
             if cnt > 0 and batch_count > 0:
                 loss /= cnt
                 accuracy /= batch_count
-                print(f"Epoch: {epoch}, Train accuracy: {accuracy:6.2f} %, Train loss: {loss:8.5f}")
+                precision /= batch_count
+                recall /= batch_count
+                f1 /= batch_count
+                print(f"Epoch: {epoch}, Train accuracy: {accuracy:6.2f} %, Precision: {precision:6.2f}, Recall: {recall:6.2f}, F1: {f1:6.2f}, Loss: {loss:8.5f}")
                 epoch_loss_train.append(loss)
                 epoch_acc_train.append(accuracy)
+                epoch_f1_train.append(f1)
             else:
                 print(f"Epoch: {epoch}, No valid batches processed")
                 epoch_loss_train.append(0)
                 epoch_acc_train.append(0)
+                epoch_f1_train.append(0)
 
             # Validation phase
             model.eval()
             val_loss = 0.
             val_accuracy = 0.
+            val_precision = 0.
+            val_recall = 0.
+            val_f1 = 0.
             val_cnt = 0.
             val_batch_count = 0
             
-            with torch.no_grad():
-                for val_batch_idx, (inputs, targets) in enumerate(tqdm(val_generator, desc="Validation")):
-                    try:
-                        # Move data to device
-                        inputs = inputs.to(device)
-                        targets = targets.to(device)
-                        
-                        # Forward pass with mixed precision if available
-                        if use_amp:
-                            with autocast():
+            # Skip validation if no validation data is available
+            if has_validation:
+                try:
+                    with torch.no_grad():
+                        for val_batch_idx, (inputs, targets) in enumerate(tqdm(val_generator)):
+                            try:
+                                # Move data to device
+                                inputs = inputs.to(device)
+                                targets = targets.to(device)
+                                
+                                # Free up memory before forward pass
+                                if device.type == 'cuda':
+                                    torch.cuda.empty_cache()
+                                
+                                # Forward pass
                                 predictions = model(inputs.float())
                                 batch_loss = criterion(predictions, targets).sum().item()
-                        else:
-                            predictions = model(inputs.float())
-                            batch_loss = criterion(predictions, targets).sum().item()
-                        
-                        # Calculate accuracy
-                        batch_accuracy = compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
-                        
-                        # Update counters
-                        val_loss += batch_loss
-                        val_accuracy += batch_accuracy
-                        val_cnt += len(targets)
-                        val_batch_count += 1
-                        
-                        # Free memory
-                        del inputs, targets, predictions
-                        if device.type == 'cuda':
-                            torch.cuda.empty_cache()
-                    except Exception as e:
-                        print(f"Error in validation batch {val_batch_idx}: {str(e)}")
-                        continue
-            
-            # Calculate validation metrics
-            if val_cnt > 0 and val_batch_count > 0:
-                val_loss /= val_cnt
-                val_accuracy /= val_batch_count
-                print(f"Epoch: {epoch}, Val accuracy: {val_accuracy:6.2f} %, Val loss: {val_loss:8.5f}")
-                epoch_loss_val.append(val_loss)
-                epoch_acc_val.append(val_accuracy)
-                
-                # Update learning rate based on scheduler type
-                if use_plateau_scheduler:
-                    scheduler.step(val_accuracy)
-                else:
-                    # Use cosine annealing scheduler
-                    scheduler.step()
+                                
+                                # Calculate metrics
+                                acc, prec, rec, f1_score = compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
+                                
+                                # Update counters
+                                val_loss += batch_loss
+                                val_accuracy += acc
+                                val_precision += prec
+                                val_recall += rec
+                                val_f1 += f1_score
+                                val_cnt += len(targets)
+                                val_batch_count += 1
+                                
+                                # Explicitly delete tensors to free memory
+                                del inputs, targets, predictions
+                                if device.type == 'cuda':
+                                    torch.cuda.empty_cache()
+                                
+                            except Exception as val_batch_e:
+                                print(f"Error processing validation batch {val_batch_idx}: {str(val_batch_e)}")
+                                traceback.print_exc()
+                                # Skip this batch but continue validation
+                                continue
                     
-                    # Check if we should switch to plateau scheduler
-                    if epoch > max_epochs // 2 and len(epoch_acc_val) > 3:
-                        # Check if validation accuracy is plateauing
-                        recent_accs = epoch_acc_val[-3:]
-                        if max(recent_accs) - min(recent_accs) < 0.5:  # Less than 0.5% change
-                            print("Validation accuracy plateauing. Switching to ReduceLROnPlateau scheduler.")
-                            use_plateau_scheduler = True
+                    # Calculate validation metrics
+                    if val_cnt > 0 and val_batch_count > 0:
+                        val_loss /= val_cnt
+                        val_accuracy /= val_batch_count
+                        val_precision /= val_batch_count
+                        val_recall /= val_batch_count
+                        val_f1 /= val_batch_count
+                        print(f"Epoch: {epoch}, Val accuracy: {val_accuracy:6.2f} %, Val precision: {val_precision:6.2f}, Val recall: {val_recall:6.2f}, Val F1: {val_f1:6.2f}, Val loss: {val_loss:8.5f}")
+                        epoch_loss_val.append(val_loss)
+                        epoch_acc_val.append(val_accuracy)
+                        epoch_f1_val.append(val_f1)
+                        
+                        # Update learning rate based on scheduler type
+                        if use_plateau_scheduler:
                             plateau_scheduler.step(val_accuracy)
-                
-                # Early stopping check
-                current_val_metric = val_accuracy
-                if current_val_metric > best_val_metric:
-                    best_val_metric = current_val_metric
-                    early_stopping_counter = 0
-                    # Save best model based on validation accuracy
-                    torch.save(model.state_dict(), PATH + exp + '_best_val_ckpt.pt')
-                    print(f"Saved new best model with validation accuracy: {val_accuracy:6.2f} %")
-                else:
-                    early_stopping_counter += 1
-                    print(f"Validation accuracy did not improve. Early stopping counter: {early_stopping_counter}/{early_stopping_patience}")
-                    if early_stopping_counter >= early_stopping_patience:
-                        print(f"Early stopping triggered after {epoch+1} epochs")
-                        break
+                        else:
+                            scheduler.step()
+                            
+                        # Early stopping check
+                        if val_accuracy > best_val_accuracy:
+                            best_val_accuracy = val_accuracy
+                            best_val_f1 = val_f1
+                            early_stopping_counter = 0
+                            # Save best validation model
+                            try:
+                                torch.save(model.state_dict(), PATH + exp + '_best_val_ckpt.pt')
+                                print(f"Saved best validation model with accuracy: {best_val_accuracy:6.2f}% and F1: {best_val_f1:6.2f}")
+                            except Exception as save_e:
+                                print(f"Error saving best validation model: {save_e}")
+                                # Try saving to CPU if GPU save fails
+                                try:
+                                    cpu_model = model.cpu()
+                                    torch.save(cpu_model.state_dict(), PATH + exp + '_best_val_cpu_ckpt.pt')
+                                    print(f"Saved best validation model to CPU with accuracy: {best_val_accuracy:6.2f}%")
+                                    model = model.to(device)  # Move back to original device
+                                except Exception as cpu_save_e:
+                                    print(f"Error saving validation model to CPU: {cpu_save_e}")
+                        else:
+                            early_stopping_counter += 1
+                            print(f"Early stopping counter: {early_stopping_counter}/{early_stopping_patience}")
+                            
+                        # Check for early stopping
+                        if early_stopping_counter >= early_stopping_patience:
+                            print(f"Early stopping triggered after {epoch+1} epochs")
+                            # Break out of the epoch loop
+                            break
+                            
+                        # Switch scheduler strategy if validation performance plateaus
+                        if epoch > 10 and len(epoch_acc_val) > 5:
+                            # Check if validation accuracy has plateaued
+                            recent_vals = epoch_acc_val[-5:]
+                            if max(recent_vals) - min(recent_vals) < 0.5:  # Less than 0.5% change
+                                if not use_plateau_scheduler:
+                                    print("Validation accuracy has plateaued. Switching to ReduceLROnPlateau scheduler.")
+                                    use_plateau_scheduler = True
+                    else:
+                        print(f"Epoch: {epoch}, No valid validation batches processed")
+                        epoch_loss_val.append(0)
+                        epoch_acc_val.append(0)
+                        epoch_f1_val.append(0)
+                        
+                except Exception as val_e:
+                    print(f"Error during validation phase: {str(val_e)}")
+                    traceback.print_exc()
+                    # Continue with next epoch even if validation fails
+                    epoch_loss_val.append(epoch_loss_val[-1] if len(epoch_loss_val) > 0 else 0)
+                    epoch_acc_val.append(epoch_acc_val[-1] if len(epoch_acc_val) > 0 else 0)
+                    epoch_f1_val.append(epoch_f1_val[-1] if len(epoch_f1_val) > 0 else 0)
             else:
-                print(f"Epoch: {epoch}, No valid validation batches processed")
+                # No validation data available
+                print(f"Epoch: {epoch}, No validation data available")
                 epoch_loss_val.append(0)
                 epoch_acc_val.append(0)
+                epoch_f1_val.append(0)
+                
+                # Update learning rate without validation metrics
+                scheduler.step()
+                
+            # Calculate epoch duration
+            epoch_duration = time.time() - epoch_start_time
+            print(f"Epoch {epoch} completed in {epoch_duration:.2f} seconds")
+            
+            # Periodically save checkpoint to prevent complete loss in case of crash
+            if epoch % 5 == 0 or epoch == max_epochs - 1:
+                try:
+                    checkpoint_path = PATH + exp + f'_epoch_{epoch}_ckpt.pt'
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict() if hasattr(scheduler, 'state_dict') else None,
+                        'best_accuracy': best_accuracy,
+                        'best_val_accuracy': best_val_accuracy,
+                        'best_val_f1': best_val_f1,
+                        'early_stop_counter': early_stopping_counter,
+                    }, checkpoint_path)
+                    print(f"Saved checkpoint at epoch {epoch} to {checkpoint_path}")
+                except Exception as ckpt_e:
+                    print(f"Error saving checkpoint at epoch {epoch}: {ckpt_e}")
 
             # Save best model based on training accuracy
-            if best_accuracy < accuracy:
+            if accuracy > best_accuracy:
                 best_accuracy = accuracy
                 torch.save(model.state_dict(), PATH + exp + '_best_train_ckpt.pt')
         except Exception as epoch_e:
             print(f"Error during epoch {epoch}: {str(epoch_e)}")
             traceback.print_exc()
-            continue   # Skip the epoch and continue to the next one
+            # Skip the epoch and continue to the next one
+            continue
 
     print(f"Best train accuracy: {best_accuracy}")
     if has_validation:
         print(f"Best validation accuracy: {best_val_accuracy}")
-    print("TRAINING COMPLETED :)")
+        print(f"Best validation F1 score: {best_val_f1}")
 
-    # Testing phase on the entire training dataset
+    # Save final model
     try:
-        print("Testing on the entire training dataset...")
-        
-        # Make sure we have enough memory for testing
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-            gc.collect()
-            
-            # Check if we have enough memory for testing
-            try:
-                free_memory = (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3
-                print(f"Available GPU memory for testing: {free_memory:.2f} GB")
-                
-                # If memory is very low, consider moving to CPU for testing
-                if free_memory < 0.5:  # Less than 500MB
-                    print("Very limited GPU memory available for testing.")
-                    print("Moving model to CPU for testing...")
-                    model = model.cpu()
-                    device = torch.device("cpu")
-            except Exception as e:
-                print(f"Error checking GPU memory: {e}")
-        
-        # Set model to evaluation mode
-        model.eval()
-        test_loss = 0.
-        test_accuracy = 0.
-        cnt = 0.
-        successful_batches = 0
-        
-        # Create a smaller batch size for testing if needed
-        test_params = params.copy()
-        if device.type == 'cuda' and params['batch_size'] > 1:
-            try:
-                free_memory = (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3
-                if free_memory < 1.0:
-                    test_params['batch_size'] = 1
-                    print(f"Reduced batch size to {test_params['batch_size']} for testing due to limited memory")
-            except Exception as e:
-                print(f"Error adjusting test batch size: {e}")
-                test_params['batch_size'] = 1  # Conservative default
-        
-        # Create a separate test data loader if needed
+        final_model_path = PATH + exp + '_final_ckpt.pt'
+        torch.save(model.state_dict(), final_model_path)
+        print(f"Saved final model to {final_model_path}")
+    except Exception as e:
+        print(f"Error saving final model: {e}")
         try:
-            if test_params != params:
-                test_generator = DataLoader(train_dataset, **test_params)
-                print(f"Created separate test data loader with batch size {test_params['batch_size']}")
+            # Try saving to CPU if GPU save fails
+            cpu_model = model.cpu()
+            cpu_model_path = PATH + exp + '_final_cpu_ckpt.pt'
+            torch.save(cpu_model.state_dict(), cpu_model_path)
+            print(f"Saved final model to CPU at {cpu_model_path}")
+            model = model.to(device)  # Move back to original device
+        except Exception as cpu_e:
+            print(f"Error saving final model to CPU: {cpu_e}")
+            print("WARNING: Final model was not saved!")
+
+    # Test the model on test data if available
+    if test_dataset is not None and len(test_dataset) > 0:
+        print("\nEvaluating model on test data...")
+        try:
+            # Load the best validation model if available
+            best_model_path = PATH + exp + '_best_val_ckpt.pt'
+            if os.path.exists(best_model_path):
+                print(f"Loading best validation model from {best_model_path}")
+                model.load_state_dict(torch.load(best_model_path, map_location=device))
             else:
-                test_generator = training_generator
-        except Exception as e:
-            print(f"Error creating test data loader: {e}")
-            print("Falling back to training generator")
-            test_generator = training_generator
-        
-        # Set a timeout for the entire testing process
-        start_time = time.time()
-        max_test_time = 1800  # 30 minutes max
-        
-        # Perform testing with no gradient computation
-        with torch.no_grad():
-            for test_batch_idx, (inputs, targets) in enumerate(tqdm(test_generator, desc="Testing")):
-                # Check if we've exceeded the maximum test time
-                if time.time() - start_time > max_test_time:
-                    print(f"Testing has been running for over {max_test_time/60:.1f} minutes. Stopping early.")
-                    break
-                
-                try:
-                    # Move data to device
-                    inputs = inputs.to(device)
-                    targets = targets.to(device)
-                    
-                    # Clear cache before forward pass
-                    if device.type == 'cuda':
-                        torch.cuda.empty_cache()
-                    
-                    # Forward pass with timeout protection
+                print("Best validation model not found. Using final model for testing.")
+            
+            # Set model to evaluation mode
+            model.eval()
+            
+            # Initialize test metrics
+            test_loss = 0.
+            test_accuracy = 0.
+            test_precision = 0.
+            test_recall = 0.
+            test_f1 = 0.
+            test_cnt = 0
+            test_batch_count = 0
+            
+            # Store predictions and targets for confusion matrix
+            all_predictions = []
+            all_targets = []
+            
+            # Test loop with error handling
+            with torch.no_grad():
+                for batch_idx, (inputs, targets) in enumerate(tqdm(test_generator, desc="Testing")):
                     try:
-                        # Set a timeout for the forward pass
-                        forward_start = time.time()
-                        forward_timeout = 30  # 30 seconds max for forward pass
+                        # Move data to device
+                        inputs = inputs.to(device)
+                        targets = targets.to(device)
                         
-                        # Start forward pass
+                        # Forward pass
                         predictions = model(inputs.float())
                         
-                        # Check if forward pass took too long
-                        if time.time() - forward_start > forward_timeout:
-                            print(f"Forward pass took too long ({time.time() - forward_start:.1f}s). Skipping this batch.")
-                            continue
-                    except Exception as forward_e:
-                        print(f"Error during forward pass: {forward_e}")
-                        traceback.print_exc()
-                        continue
-                    
-                    # Calculate metrics
-                    try:
+                        # Calculate loss
                         batch_loss = criterion(predictions, targets).sum().item()
-                        batch_accuracy = compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
-                    except Exception as metric_e:
-                        print(f"Error calculating metrics: {metric_e}")
-                        traceback.print_exc()
-                        # Use default values
-                        batch_loss = 0.0
-                        batch_accuracy = 0.0
-                    
-                    # Update counters
-                    test_loss += batch_loss
-                    test_accuracy += batch_accuracy
-                    cnt += len(targets)
-                    successful_batches += 1
-                    
-                    # Free memory
-                    del inputs, targets, predictions
-                    if device.type == 'cuda':
-                        torch.cuda.empty_cache()
-                    
-                    # Periodically run garbage collection
-                    if test_batch_idx % 5 == 0:
-                        gc.collect()
                         
-                except RuntimeError as e:
-                    if 'out of memory' in str(e):
-                        print(f"CUDA out of memory encountered on test batch {test_batch_idx}. Clearing cache and trying to continue...")
-                        if torch.cuda.is_available():
-                            try:
-                                print(torch.cuda.memory_summary(device=device))
-                            except:
-                                print("Could not print CUDA memory summary")
-                        torch.cuda.empty_cache()
-                        gc.collect()
+                        # Calculate metrics
+                        acc, prec, rec, f1_score = compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
                         
-                        # If this is not the first batch and we're using GPU, try to move to CPU
-                        if test_batch_idx > 0 and device.type == 'cuda':
-                            print("Moving model to CPU to continue testing...")
-                            try:
-                                model = model.cpu()
-                                device = torch.device("cpu")
-                                continue
-                            except Exception as cpu_e:
-                                print(f"Error moving model to CPU: {cpu_e}")
-                        elif test_params['batch_size'] > 1:
-                            # Try with smaller batch size
-                            test_params['batch_size'] = 1
-                            print(f"Reducing batch size to {test_params['batch_size']} and recreating test data loader")
-                            try:
-                                test_generator = DataLoader(train_dataset, **test_params)
-                                # Restart testing
-                                test_loss = 0.
-                                test_accuracy = 0.
-                                cnt = 0.
-                                successful_batches = 0
-                                break
-                            except Exception as dl_e:
-                                print(f"Error recreating data loader: {dl_e}")
-                        else:
-                            print("Cannot reduce batch size further. Skipping this batch.")
-                            continue
-                    else:
-                        print(f"Runtime error in test batch {test_batch_idx}: {str(e)}")
+                        # Store predictions and targets for later analysis
+                        pred_binary = (torch.sigmoid(predictions.detach().cpu()) > inf_threshold).float()
+                        all_predictions.append(pred_binary)
+                        all_targets.append(targets.cpu())
+                        
+                        # Update counters
+                        test_loss += batch_loss
+                        test_accuracy += acc
+                        test_precision += prec
+                        test_recall += rec
+                        test_f1 += f1_score
+                        test_cnt += len(targets)
+                        test_batch_count += 1
+                        
+                        # Free memory
+                        del inputs, targets, predictions
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                            
+                    except Exception as e:
+                        print(f"Error processing test batch {batch_idx}: {e}")
                         traceback.print_exc()
                         continue
-                except Exception as e:
-                    print(f"Error in test batch {test_batch_idx}: {str(e)}")
-                    traceback.print_exc()
-                    continue
             
-            # Calculate final metrics
-            if successful_batches > 0:
-                if cnt > 0:
-                    test_loss /= cnt
-                    test_accuracy /= successful_batches
-                    print(f"Test metrics - Accuracy: {test_accuracy:6.2f} %, Loss: {test_loss:8.5f}")
-                    print(f"Successfully processed {cnt} samples in {successful_batches} batches")
-                    
-                    # Save results to a file
-                    try:
-                        with open(PATH + "test_results.txt", "w") as f:
-                            f.write(f"Model: {exp}_ckpt.pt\n")
-                            f.write(f"Accuracy: {test_accuracy:6.2f} %\n")
-                            f.write(f"Loss: {test_loss:8.5f}\n")
-                            f.write(f"Samples: {cnt}\n")
-                            f.write(f"Batches: {successful_batches}\n")
-                            f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                        print(f"Test results saved to {PATH}test_results.txt")
-                    except Exception as save_e:
-                        print(f"Error saving results: {save_e}")
-                else:
-                    print("No test samples were successfully processed. Testing failed.")
-            else:
-                print("No batches were successfully processed. Testing failed.")
+            # Calculate final test metrics
+            if test_cnt > 0 and test_batch_count > 0:
+                test_loss /= test_cnt
+                test_accuracy /= test_batch_count
+                test_precision /= test_batch_count
+                test_recall /= test_batch_count
+                test_f1 /= test_batch_count
                 
-                # Try one last approach - process a single random tensor
+                # Print test metrics
+                print("\nTest Results:")
+                print(f"Accuracy: {test_accuracy:6.2f}%")
+                print(f"Precision: {test_precision:6.2f}")
+                print(f"Recall: {test_recall:6.2f}")
+                print(f"F1 Score: {test_f1:6.2f}")
+                print(f"Loss: {test_loss:8.5f}")
+                print(f"Samples: {test_cnt}")
+                
+                # Save test results to file
                 try:
-                    print("Trying to process a single random tensor...")
-                    random_input = torch.rand(1, 3, 16, 120, 120).to(device)
-                    random_output = model(random_input)
-                    print(f"Model successfully processed a random tensor of shape {random_input.shape}")
-                    print(f"Output shape: {random_output.shape}")
-                    del random_input, random_output
-                except Exception as random_e:
-                    print(f"Error processing random tensor: {random_e}")
-    except Exception as test_e:
-        print("Error during testing:", str(test_e))
-        traceback.print_exc()
-        print("Testing failed, but training was completed successfully.")
-    finally:
-        # Clean up resources
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-        print("Testing phase completed.")
+                    results_path = os.path.join(PATH, f"{exp}_test_results.txt")
+                    with open(results_path, "w") as f:
+                        f.write("Test Results:\n")
+                        f.write(f"Accuracy: {test_accuracy:6.2f}%\n")
+                        f.write(f"Precision: {test_precision:6.2f}\n")
+                        f.write(f"Recall: {test_recall:6.2f}\n")
+                        f.write(f"F1 Score: {test_f1:6.2f}\n")
+                        f.write(f"Loss: {test_loss:8.5f}\n")
+                        f.write(f"Samples: {test_cnt}\n")
+                        f.write(f"Batches: {test_batch_count}\n")
+                        f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    print(f"Test results saved to {results_path}")
+                    
+                    # Try to generate per-class metrics
+                    try:
+                        # Concatenate all predictions and targets
+                        all_pred_tensor = torch.cat(all_predictions, dim=0).numpy()
+                        all_target_tensor = torch.cat(all_targets, dim=0).numpy()
+                        
+                        # Calculate per-class metrics
+                        precision_per_class, recall_per_class, f1_per_class, support_per_class = \
+                            precision_recall_fscore_support(all_target_tensor, all_pred_tensor, average=None, zero_division=0)
+                        
+                        # Save per-class metrics
+                        per_class_path = os.path.join(PATH, f"{exp}_per_class_metrics.txt")
+                        with open(per_class_path, "w") as f:
+                            f.write("Per-Class Metrics:\n")
+                            f.write("Class\tPrecision\tRecall\tF1\tSupport\n")
+                            for i in range(len(precision_per_class)):
+                                f.write(f"{i}\t{precision_per_class[i]:.4f}\t{recall_per_class[i]:.4f}\t{f1_per_class[i]:.4f}\t{support_per_class[i]}\n")
+                        print(f"Per-class metrics saved to {per_class_path}")
+                    except Exception as per_class_e:
+                        print(f"Error calculating per-class metrics: {per_class_e}")
+                except Exception as results_e:
+                    print(f"Error saving test results: {results_e}")
+            else:
+                print("No valid test batches processed")
+        except Exception as test_e:
+            print(f"Error during testing: {test_e}")
+            traceback.print_exc()
+    else:
+        print("No test dataset available for evaluation")
 
+    # Generate and save training plots
     try:
-        # Save visualization
+        print("Generating training plots...")
         get_plot(PATH, epoch_acc_train, epoch_acc_val, 'Accuracy-' + exp, 'Train Accuracy', 'Val Accuracy', 'Epochs', 'Acc')
         get_plot(PATH, epoch_loss_train, epoch_loss_val, 'Loss-' + exp, 'Train Loss', 'Val Loss', 'Epochs', 'Loss')
+        get_plot(PATH, epoch_f1_train, epoch_f1_val, 'F1-' + exp, 'Train F1', 'Val F1', 'Epochs', 'F1')
         print("Successfully saved visualization plots.")
-    except Exception as e:
-        print("Error while plotting:", str(e))
+    except Exception as plot_e:
+        print(f"Error generating plots: {plot_e}")
         traceback.print_exc()
-        print("Continuing without saving plots...")
 
-    try:
-        # Save trained model
-        print("Saving final model checkpoint...")
-        
-        # First try to save just the state dict (smaller file)
-        try:
-            save_path = exp + "_ckpt.pt"
-            torch.save(model.state_dict(), save_path)
-            print(f"Successfully saved model state dict to {save_path}")
-        except Exception as state_dict_error:
-            print(f"Error saving model state dict: {state_dict_error}")
-            
-            # If that fails, try saving to a different location
-            try:
-                alternate_path = os.path.join(PATH, exp + "_ckpt.pt")
-                torch.save(model.state_dict(), alternate_path)
-                print(f"Successfully saved model state dict to alternate path: {alternate_path}")
-            except Exception as alt_path_error:
-                print(f"Error saving to alternate path: {alt_path_error}")
-                
-                # If that also fails, try saving the full model
-                try:
-                    print("Attempting to save full model instead...")
-                    torch.save(model, PATH + exp + "_full_model.pt")
-                    print(f"Successfully saved full model to {PATH + exp + '_full_model.pt'}")
-                except Exception as full_model_error:
-                    print(f"Error saving full model: {full_model_error}")
-                    
-                    # Last resort: try saving to CPU first
-                    try:
-                        print("Moving model to CPU and trying to save...")
-                        cpu_model = model.cpu()
-                        torch.save(cpu_model.state_dict(), PATH + exp + "_cpu_ckpt.pt")
-                        print(f"Successfully saved CPU model to {PATH + exp + '_cpu_ckpt.pt'}")
-                        # Move model back to original device
-                        model = model.to(device)
-                    except Exception as cpu_error:
-                        print(f"All attempts to save model failed: {cpu_error}")
-                        print("WARNING: Model was not saved!")
-    except Exception as e:
-        print("Error while saving the trained model:", str(e))
-        traceback.print_exc()
-        print("WARNING: Model was not saved!")
+    # Close error log if it was opened
+    if error_log:
+        error_log.close()
+        sys.stderr = sys.__stderr__
+        print(f"Error log saved to {error_log_path}")
+
+    # Print training summary
+    print("\nTraining Summary:")
+    print(f"Total epochs completed: {epoch + 1}")
+    print(f"Best training accuracy: {best_accuracy:.2f}%")
+    if has_validation:
+        print(f"Best validation accuracy: {best_val_accuracy:.2f}%")
+        print(f"Best validation F1 score: {best_val_f1:.2f}")
+    print(f"Training completed at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Total training time: {(time.time() - start_time) / 60:.2f} minutes")
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()
