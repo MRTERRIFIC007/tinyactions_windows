@@ -441,6 +441,7 @@ def main():
                     raise
 
         # Create the dataset using TinyVIRAT_dataset with augmentation
+        print("Creating training dataset with augmentation...")
         train_dataset = TinyVIRAT_dataset(
             list_IDs=list_IDs, 
             IDs_path=IDs_path, 
@@ -449,6 +450,26 @@ def main():
             use_augmentation=True,
             is_training=True
         )
+        
+        # Create a small initial DataLoader to preload some videos into cache
+        # This helps warm up the cache before full training starts
+        print("Preloading some videos to warm up cache...")
+        preload_params = params.copy()
+        preload_params['batch_size'] = 1  # Use small batch size for preloading
+        preload_params['num_workers'] = 1  # Use single worker for deterministic loading
+        preload_params['shuffle'] = False  # Load in order
+        
+        # Create a small subset of videos to preload (first 100 videos)
+        preload_size = min(100, len(list_IDs))
+        preload_indices = list(range(0, len(list_IDs), len(list_IDs) // preload_size))[:preload_size]
+        
+        # Create a simple progress bar for preloading
+        for idx in tqdm(preload_indices, desc="Preloading videos"):
+            # Access the video to load it into cache
+            _ = train_dataset[idx]
+        
+        # Now create the actual training DataLoader
+        print("Creating training data loader...")
         training_generator = DataLoader(train_dataset, **params)
         
         # Create a validation set (20% of training data)
@@ -491,19 +512,27 @@ def main():
                 train_list_IDs = list_IDs[:train_size]
                 val_list_IDs = list_IDs[train_size:]
             
-            # Create validation dataset and dataloader (no augmentation for validation)
+            # Create validation dataset
+            print("Creating validation dataset...")
             val_dataset = TinyVIRAT_dataset(
-                list_IDs=[id for id in val_list_IDs], 
+                list_IDs=val_list_IDs, 
                 IDs_path=IDs_path, 
                 labels=labels, 
                 frame_by_frame=False,
-                use_augmentation=False,
+                use_augmentation=False,  # No augmentation for validation
                 is_training=False
             )
-            val_params = params.copy()
-            val_params['shuffle'] = False  # No need to shuffle validation data
-            val_generator = DataLoader(val_dataset, **val_params)
-            print(f"Created validation set with {len(val_list_IDs)} videos")
+            
+            # Preload some validation videos
+            print("Preloading some validation videos...")
+            val_preload_size = min(50, len(val_list_IDs))
+            val_preload_indices = list(range(0, len(val_list_IDs), len(val_list_IDs) // val_preload_size))[:val_preload_size]
+            for idx in tqdm(val_preload_indices, desc="Preloading validation videos"):
+                _ = val_dataset[idx]
+            
+            # Create validation data loader
+            print("Creating validation data loader...")
+            val_generator = DataLoader(val_dataset, **params)
             
             # Update training dataset
             train_dataset = TinyVIRAT_dataset(

@@ -322,7 +322,6 @@ class TinyVIRAT_dataset(Dataset):
             frame = self.single_video_frames[index]
             frame = frame.unsqueeze(0)
             X = self.transform(frame)
-            X = X.to(device)  # move tensor to GPU if available
             y = torch.Tensor(self.labels[self.list_IDs[0]])
             return X, y
         elif self.frame_index_map is not None:
@@ -350,17 +349,19 @@ class TinyVIRAT_dataset(Dataset):
             # Unsqueeze to add temporal dimension: (1, H, W, C)
             frame = frame.unsqueeze(0)
             X = self.transform(frame)
-            X = X.to(device)  # move tensor to GPU if available
             y = torch.Tensor(self.labels[vid])
             return X, y
         else:
             # Default: treat each video as one sample (build a clip)
             ID = self.list_IDs[index]
-            if index % 500 == 0:  # Reduced frequency of logging
+            
+            # Only print loading message for the first few videos and then every 1000 videos
+            # This reduces console output while still providing progress information
+            if index < 10 or index % 1000 == 0:
                 print(f"Loading video {index}: {ID}")
+                
             sample_path = self.IDs_path[ID]
             X = self.build_sample(sample_path)
-            X = X.to(device)  # move tensor to GPU if available
             y = torch.Tensor(self.labels[ID])
             return X, y
 
