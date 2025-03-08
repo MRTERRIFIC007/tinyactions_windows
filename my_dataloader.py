@@ -6,40 +6,6 @@ import numpy as np
 import config as cfg
 import Preprocessing
 import os
-import random
-import functools
-from concurrent.futures import ThreadPoolExecutor
-import threading
-
-# Add a simple LRU cache for video frames
-class LRUCache:
-    def __init__(self, capacity=32):
-        self.cache = {}
-        self.capacity = capacity
-        self.lock = threading.Lock()
-    
-    def get(self, key):
-        with self.lock:
-            if key in self.cache:
-                # Move to the end to show it was recently used
-                value = self.cache.pop(key)
-                self.cache[key] = value
-                return value
-            return None
-    
-    def put(self, key, value):
-        with self.lock:
-            if key in self.cache:
-                # Remove the existing key
-                self.cache.pop(key)
-            elif len(self.cache) >= self.capacity:
-                # Remove the first item (least recently used)
-                self.cache.pop(next(iter(self.cache)))
-            # Add new key-value pair
-            self.cache[key] = value
-
-# Create a global cache for video frames
-video_frame_cache = LRUCache(capacity=64)  # Cache up to 64 videos
 
 ############ Helper Functions ##############
 def resize(frames, size, interpolation='bilinear'):
@@ -77,149 +43,20 @@ class Normalize(object):
     def __call__(self, vid):
         return normalize(vid, self.mean, self.std)
 
-# Data augmentation transforms
-class RandomHorizontalFlip(object):
-    def __init__(self, p=0.5):
-        self.p = p
-        
-    def __call__(self, vid):
-        if random.random() < self.p:
-            return torch.flip(vid, [3])  # Flip width dimension
-        return vid
-
-class RandomColorJitter(object):
-    def __init__(self, brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05):
-        self.brightness = brightness
-        self.contrast = contrast
-        self.saturation = saturation
-        self.hue = hue
-        
-    def __call__(self, vid):
-        # Apply color jitter to each frame
-        # vid shape: C, T, H, W
-        C, T, H, W = vid.shape
-        
-        # Randomly adjust brightness, contrast, saturation, hue
-        brightness_factor = random.uniform(1-self.brightness, 1+self.brightness)
-        contrast_factor = random.uniform(1-self.contrast, 1+self.contrast)
-        saturation_factor = random.uniform(1-self.saturation, 1+self.saturation)
-        hue_factor = random.uniform(-self.hue, self.hue)
-        
-        # Apply to each frame
-        result = vid.clone()
-        for t in range(T):
-            frame = vid[:, t, :, :]  # C, H, W
-            
-            # Brightness
-            frame = frame * brightness_factor
-            
-            # Contrast
-            mean = torch.mean(frame, dim=[1, 2], keepdim=True)
-            frame = (frame - mean) * contrast_factor + mean
-            
-            # Clamp values to [0, 1]
-            frame = torch.clamp(frame, 0, 1)
-            
-            result[:, t, :, :] = frame
-            
-        return result
-
-class RandomCrop(object):
-    def __init__(self, size):
-        self.size = size
-        
-    def __call__(self, vid):
-        # vid shape: C, T, H, W
-        C, T, H, W = vid.shape
-        
-        # Calculate crop dimensions
-        new_h, new_w = self.size, self.size
-        
-        # Don't crop if the video is already smaller than the crop size
-        if H <= new_h or W <= new_w:
-            return vid
-            
-        # Random crop position
-        top = random.randint(0, H - new_h)
-        left = random.randint(0, W - new_w)
-        
-        # Crop the video
-        return vid[:, :, top:top+new_h, left:left+new_w]
-
-class RandomRotation(object):
-    def __init__(self, degrees=10):
-        self.degrees = degrees
-        
-    def __call__(self, vid):
-        # vid shape: C, T, H, W
-        C, T, H, W = vid.shape
-        
-        # Random rotation angle
-        angle = random.uniform(-self.degrees, self.degrees)
-        
-        # Apply rotation to each frame
-        result = torch.zeros_like(vid)
-        for t in range(T):
-            frame = vid[:, t, :, :]  # C, H, W
-            
-            # Convert to numpy for OpenCV
-            frame_np = frame.permute(1, 2, 0).numpy()  # H, W, C
-            
-            # Get rotation matrix
-            center = (W // 2, H // 2)
-            M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            
-            # Apply rotation
-            rotated = cv2.warpAffine(frame_np, M, (W, H))
-            
-            # Convert back to tensor
-            result[:, t, :, :] = torch.from_numpy(rotated).permute(2, 0, 1)
-            
-        return result
 
 ################# TinyVIRAT Dataset ###################
 class TinyVIRAT_dataset(Dataset):
     'Characterizes a dataset for PyTorch'
-    def __init__(self, list_IDs, IDs_path, labels, num_frames=cfg.video_params['num_frames'], input_size=cfg.video_params['height'], frame_by_frame=False, use_augmentation=True, is_training=True, cache_size=64):
+    def __init__(self, list_IDs, IDs_path, labels, num_frames=cfg.video_params['num_frames'], input_size=cfg.video_params['height'], frame_by_frame=False):
         "Initialization"
         self.labels = labels
+        self.list_IDs = list_IDs
         self.IDs_path = IDs_path
         self.num_frames = num_frames
         self.input_size = input_size
-        self.frame_by_frame = frame_by_frame
-        self.is_training = is_training
-        self.use_augmentation = use_augmentation
-        
-        # Sort list_IDs for predictable ordering
-        self.list_IDs = sorted(list_IDs)
-        print(f"Dataset initialized with {len(self.list_IDs)} videos in sorted order")
-        
-        # Initialize video frame cache
-        self.cache_size = cache_size
-        self.video_frame_cache = video_frame_cache
-        
-        # Basic transforms
         self.resize = Resize((self.input_size, self.input_size))
         self.normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        
-        # Create transform pipeline
-        if self.use_augmentation:
-            print("Using data augmentation for training")
-            self.transform = transforms.Compose([
-                ToFloatTensorInZeroOne(),
-                self.resize,
-                RandomHorizontalFlip(p=0.5),
-                RandomColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
-                RandomRotation(degrees=10),
-                RandomCrop(size=input_size) if input_size < 120 else Resize(input_size),
-                self.normalize
-            ])
-        else:
-            self.transform = transforms.Compose([
-                ToFloatTensorInZeroOne(),
-                self.resize,
-                self.normalize
-            ])
+        self.transform = transforms.Compose([ToFloatTensorInZeroOne(), self.resize, self.normalize])
         
         # For single video scenario, load all frames
         if len(self.list_IDs) == 1:
@@ -229,6 +66,7 @@ class TinyVIRAT_dataset(Dataset):
             self.frame_index_map = None
         else:
             self.single_video_frames = None
+            self.frame_by_frame = frame_by_frame
             if self.frame_by_frame:
                 # Build a mapping from a global sample index to (video_id, frame_index)
                 self.frame_index_map = []
@@ -245,68 +83,36 @@ class TinyVIRAT_dataset(Dataset):
             else:
                 self.frame_index_map = None
 
-    @functools.lru_cache(maxsize=8)  # Cache the last 8 videos loaded
     def load_all_frames(self, video_path):
-        """Load all frames from a video with caching"""
-        # Check if video is in cache
-        cached_frames = self.video_frame_cache.get(video_path)
-        if cached_frames is not None:
-            return cached_frames
-            
-        # If not in cache, load the video
         vidcap = cv2.VideoCapture(video_path)
-        if not vidcap.isOpened():
-            raise ValueError(f"Could not open video file: {video_path}")
-            
         frame_count = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
         frame_width = int(vidcap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        # Pre-allocate numpy array for frames (more efficient than appending)
-        frames = np.empty((frame_count, frame_height, frame_width, 3), dtype=np.uint8)
-        
         ret = True
-        frame_idx = 0
-        while ret and frame_idx < frame_count:
+        frames = []
+        while ret:
             ret, frame = vidcap.read()
             if not ret:
                 break
-            # Convert BGR to RGB
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames[frame_idx] = frame
-            frame_idx += 1
-            
+            frames.append(frame)
         vidcap.release()
-        
-        # Adjust if we didn't read all frames
-        if frame_idx < frame_count:
-            frames = frames[:frame_idx]
-            
-        # Convert to tensor
-        frames_tensor = torch.from_numpy(frames)
-        
-        # Store in cache
-        self.video_frame_cache.put(video_path, frames_tensor)
-        
-        return frames_tensor
+        assert len(frames) == frame_count
+        frames = torch.from_numpy(np.stack(frames))
+        return frames
 
     def build_sample(self, video_path):
-        """Build a sample from a video path with efficient frame handling"""
         frames = self.load_all_frames(video_path)
         count_frames = frames.shape[0]
-        
-        # Handle videos with different frame counts
         if count_frames > self.num_frames:
-            # Uniformly sample frames if we have more than we need
-            indices = torch.linspace(0, count_frames - 1, self.num_frames).long()
-            frames = frames[indices]
-        elif count_frames < self.num_frames:
-            # Pad with last frame if we have fewer than we need
-            last_frame = frames[-1].unsqueeze(0)  # Add batch dimension
-            padding = last_frame.repeat(self.num_frames - count_frames, 1, 1, 1)
-            frames = torch.cat([frames, padding], dim=0)
-            
-        # Apply transforms
+            frames = frames[:self.num_frames]
+        elif count_frames < self.num_frames:  # Repeat last frame
+            diff = self.num_frames - count_frames
+            last_frame = frames[-1, :, :, :]
+            tiled = np.tile(last_frame, (diff, 1, 1, 1))
+            frames = np.append(frames, tiled, axis=0)
+        if isinstance(frames, np.ndarray):
+            frames = torch.from_numpy(frames)
         clips = self.transform(frames)
         return clips
 
@@ -325,45 +131,37 @@ class TinyVIRAT_dataset(Dataset):
             frame = self.single_video_frames[index]
             frame = frame.unsqueeze(0)
             X = self.transform(frame)
+            X = X.to(device)  # move tensor to GPU if available
             y = torch.Tensor(self.labels[self.list_IDs[0]])
             return X, y
         elif self.frame_index_map is not None:
             # Frame-by-frame mode for multiple videos.
             vid, frame_num = self.frame_index_map[index]
             video_path = self.IDs_path[vid]
-            
-            # Try to get all frames from cache first
-            cached_frames = self.video_frame_cache.get(video_path)
-            if cached_frames is not None and frame_num < len(cached_frames):
-                frame = cached_frames[frame_num]
-            else:
-                # If not in cache, load just this frame
-                cap = cv2.VideoCapture(video_path)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-                ret, frame = cap.read()
-                cap.release()
-                if not ret:
-                    raise Exception(f"Could not read frame {frame_num} from video {vid}")
-                # Convert frame from BGR to RGB
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # Convert frame to tensor
-                frame = torch.from_numpy(frame)
-            
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = cap.read()
+            cap.release()
+            if not ret:
+                raise Exception(f"Could not read frame {frame_num} from video {vid}")
+            # Convert frame from BGR to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Convert frame to tensor (H, W, C)
+            frame = torch.from_numpy(frame)
             # Unsqueeze to add temporal dimension: (1, H, W, C)
             frame = frame.unsqueeze(0)
             X = self.transform(frame)
+            X = X.to(device)  # move tensor to GPU if available
             y = torch.Tensor(self.labels[vid])
             return X, y
         else:
             # Default: treat each video as one sample (build a clip)
             ID = self.list_IDs[index]
-            
-            # Print loading message for every 100 videos in sequential order
             if index % 100 == 0:
-                print(f"Loading video {index}/{len(self.list_IDs)}: {ID}")
-                
+                print(f"Loading video {index}: {ID}")
             sample_path = self.IDs_path[ID]
             X = self.build_sample(sample_path)
+            X = X.to(device)  # move tensor to GPU if available
             y = torch.Tensor(self.labels[ID])
             return X, y
 
@@ -446,12 +244,6 @@ def get_video_data(root_path, num_classes=26):
     list_IDs = []
     IDs_path = {}
     labels = {}
-    
-    # Check if the directory exists
-    if not os.path.exists(root_path):
-        print(f"Warning: Directory {root_path} does not exist.")
-        return list_IDs, labels, IDs_path
-    
     for subdir, dirs, files in os.walk(root_path):
         for file in files:
             if file.endswith('.mp4'):
@@ -461,7 +253,6 @@ def get_video_data(root_path, num_classes=26):
                 list_IDs.append(video_id)
                 IDs_path[video_id] = full_path
                 labels[video_id] = [0] * num_classes
-    
     return list_IDs, labels, IDs_path
 
 if __name__ == '__main__':
