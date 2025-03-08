@@ -13,6 +13,7 @@ import multiprocessing
 import traceback
 import gc
 import time
+import random
 
 # Import for mixed precision training
 try:
@@ -133,9 +134,18 @@ def main():
         
         # Increase epochs for CPU training to compensate for smaller model
         if not torch.cuda.is_available():
-            max_epochs = 10  # More epochs for CPU training
+            max_epochs = 20  # More epochs for CPU training (increased from 10)
         else:
-            max_epochs = 5  # Fewer epochs for GPU
+            # Increase GPU epochs as well for better accuracy
+            if torch.cuda.get_device_properties(0).total_memory / 1024**3 < 4:
+                max_epochs = 10  # For GPUs with less than 4GB memory
+            else:
+                max_epochs = 15  # For GPUs with more memory
+        
+        # Add early stopping to prevent overfitting
+        early_stopping_patience = 5
+        early_stopping_counter = 0
+        best_val_metric = 0
         
         params = {
             'batch_size': batch_size,
@@ -144,7 +154,7 @@ def main():
         }
         
         inf_threshold = 0.6
-        print(f"Training parameters: batch_size={batch_size}, grad_accumulation={grad_accumulation_steps}, epochs={max_epochs}")
+        print(f"Training parameters: batch_size={batch_size}, grad_accumulation={grad_accumulation_steps}, epochs={max_epochs}, early_stopping_patience={early_stopping_patience}")
     except Exception as e:
         print("Error during training parameter initialization:", str(e))
         traceback.print_exc()
@@ -227,8 +237,15 @@ def main():
                     print(f"Error setting up sample video: {e}")
                     raise
 
-        # Create the dataset using TinyVIRAT_dataset
-        train_dataset = TinyVIRAT_dataset(list_IDs=list_IDs, IDs_path=IDs_path, labels=labels, frame_by_frame=False)
+        # Create the dataset using TinyVIRAT_dataset with augmentation
+        train_dataset = TinyVIRAT_dataset(
+            list_IDs=list_IDs, 
+            IDs_path=IDs_path, 
+            labels=labels, 
+            frame_by_frame=False,
+            use_augmentation=True,
+            is_training=True
+        )
         training_generator = DataLoader(train_dataset, **params)
         
         # Create a validation set (20% of training data)
@@ -240,12 +257,14 @@ def main():
             train_list_IDs = list_IDs[:train_size]
             val_list_IDs = list_IDs[train_size:]
             
-            # Create validation dataset and dataloader
+            # Create validation dataset and dataloader (no augmentation for validation)
             val_dataset = TinyVIRAT_dataset(
                 list_IDs=[id for id in val_list_IDs], 
                 IDs_path=IDs_path, 
                 labels=labels, 
-                frame_by_frame=False
+                frame_by_frame=False,
+                use_augmentation=False,
+                is_training=False
             )
             val_params = params.copy()
             val_params['shuffle'] = False  # No need to shuffle validation data
@@ -257,7 +276,9 @@ def main():
                 list_IDs=[id for id in train_list_IDs], 
                 IDs_path=IDs_path, 
                 labels=labels, 
-                frame_by_frame=False
+                frame_by_frame=False,
+                use_augmentation=True,
+                is_training=True
             )
             training_generator = DataLoader(train_dataset, **params)
             print(f"Updated training set with {len(train_list_IDs)} videos")
@@ -337,8 +358,8 @@ def main():
                 num_classes=26,
                 patch_size=(2,4,4),
                 in_chans=3,
-                embed_dim=24,  # Slightly larger than tiny model
-                depths=[1, 1, 1, 1],
+                embed_dim=32,  # Increased from 24 for better representation
+                depths=[1, 1, 2, 1],  # Slightly deeper model
                 num_heads=[2, 2, 2, 2],  # More heads for better representation
                 window_size=(8,7,7),
                 mlp_ratio=4.
@@ -423,30 +444,77 @@ def main():
         # Define loss and optimizer
         lr = 0.02
         wt_decay = 5e-4
-        criterion = torch.nn.BCEWithLogitsLoss()
+        
+        # Use focal loss for better handling of class imbalance
+        try:
+            from torch.nn import functional as F
+            
+            class FocalLoss(torch.nn.Module):
+                def __init__(self, gamma=2.0, alpha=0.25, reduction='mean'):
+                    super(FocalLoss, self).__init__()
+                    self.gamma = gamma
+                    self.alpha = alpha
+                    self.reduction = reduction
+                
+                def forward(self, inputs, targets):
+                    BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+                    pt = torch.exp(-BCE_loss)  # prevents nans when probability 0
+                    F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+                    
+                    if self.reduction == 'sum':
+                        return F_loss.sum()
+                    elif self.reduction == 'mean':
+                        return F_loss.mean()
+                    else:
+                        return F_loss
+            
+            # Use focal loss for better handling of imbalanced data
+            criterion = FocalLoss(gamma=2.0, alpha=0.25)
+            print("Using Focal Loss for better handling of class imbalance")
+        except Exception as e:
+            print(f"Could not initialize Focal Loss: {e}. Using BCEWithLogitsLoss instead.")
+            criterion = torch.nn.BCEWithLogitsLoss()
         
         # Adjust learning rate based on device and model size
         if device.type == 'cpu':
             # Lower learning rate for CPU training
-            lr = 0.005
+            lr = 0.003
             print(f"Using reduced learning rate for CPU: {lr}")
         elif hasattr(model, 'embed_dim') and model.embed_dim < 96:
             # Lower learning rate for smaller models
-            lr = 0.01
+            lr = 0.008
             print(f"Using reduced learning rate for small model: {lr}")
         
-        # Use Adam optimizer for better memory efficiency on small GPUs
-        if device.type == 'cuda' and (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3 < 2.0:
-            print("Using Adam optimizer for better memory efficiency")
-            optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wt_decay)
-        else:
-            optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wt_decay)
+        # Use cosine annealing with warm restarts for better convergence
+        try:
+            # Use AdamW optimizer for better generalization
+            if device.type == 'cuda' and (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3 < 2.0:
+                print("Using AdamW optimizer for better memory efficiency and generalization")
+                optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wt_decay)
+            else:
+                print("Using SGD optimizer with momentum")
+                optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wt_decay)
+            
+            # Use cosine annealing with warm restarts
+            T_0 = max(5, max_epochs // 3)  # Restart every T_0 epochs
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=T_0, T_mult=1, eta_min=lr/10
+            )
+            print(f"Using CosineAnnealingWarmRestarts scheduler with T_0={T_0}")
+            
+            # Create a backup scheduler for plateau detection
+            plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='max', factor=0.5, patience=3, verbose=True
+            )
+            use_plateau_scheduler = False  # Start with cosine, switch to plateau if needed
+        except Exception as e:
+            print(f"Error setting up advanced scheduler: {e}")
+            # Fallback to simple scheduler
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='max', factor=0.5, patience=2, verbose=True
+            )
+            use_plateau_scheduler = True
 
-        # Learning rate scheduler - reduce LR when plateauing
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=2, verbose=True
-        )
-        
         # ASAM with adjusted parameters for memory efficiency
         if device.type == 'cuda' and (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3 < 1.0:
             # Use smaller rho for limited memory
@@ -457,7 +525,14 @@ def main():
             rho = 0.55
             eta = 0.01
         
-        minimizer = ASAM(optimizer, model, rho=rho, eta=eta)
+        # Initialize ASAM minimizer
+        try:
+            minimizer = ASAM(optimizer, model, rho=rho, eta=eta)
+            use_asam = True
+            print(f"Using ASAM optimizer with rho={rho}, eta={eta}")
+        except Exception as e:
+            print(f"Error initializing ASAM: {e}. Using standard optimizer.")
+            use_asam = False
     except Exception as e:
         print("Error during loss, optimizer, or ASAM initialization:", str(e))
         traceback.print_exc()
@@ -486,6 +561,28 @@ def main():
                     # Move data to device
                     inputs = inputs.to(device)
                     targets = targets.to(device)
+                    
+                    # Apply mixup data augmentation (with 50% probability)
+                    apply_mixup = random.random() < 0.5 and len(inputs) > 1
+                    if apply_mixup:
+                        try:
+                            # Create mixed samples
+                            alpha = 0.2  # Mixup interpolation strength
+                            lam = np.random.beta(alpha, alpha)
+                            batch_size = inputs.size(0)
+                            index = torch.randperm(batch_size).to(device)
+                            
+                            # Mix inputs and targets
+                            mixed_inputs = lam * inputs + (1 - lam) * inputs[index]
+                            mixed_targets = lam * targets + (1 - lam) * targets[index]
+                            
+                            # Use mixed data
+                            inputs = mixed_inputs
+                            targets = mixed_targets
+                        except Exception as mixup_e:
+                            print(f"Error applying mixup: {mixup_e}")
+                            # Continue with original data
+                            apply_mixup = False
 
                     # Only zero gradients at the beginning of accumulation steps
                     if batch_idx % grad_accumulation_steps == 0:
@@ -502,7 +599,7 @@ def main():
                     # Forward pass with mixed precision if available
                     if use_amp:
                         with autocast():
-                            # Ascent Step
+                            # Forward pass
                             predictions = model(inputs.float())
                             batch_loss = criterion(predictions, targets)
                             # Scale loss by accumulation steps
@@ -513,24 +610,34 @@ def main():
                         
                         # Only update weights after accumulating gradients
                         if (batch_idx + 1) % grad_accumulation_steps == 0 or (batch_idx + 1) == len(training_generator):
-                            # Ascent step
-                            scaler.unscale_(optimizer)
-                            minimizer.ascent_step()
-                            
-                            # Descent step
-                            with autocast():
-                                descent_loss = criterion(model(inputs.float()), targets)
-                                descent_loss = descent_loss.mean() / grad_accumulation_steps
-                            
-                            scaler.scale(descent_loss).backward()
-                            scaler.unscale_(optimizer)
-                            minimizer.descent_step()
+                            if use_asam:
+                                # Ascent step with ASAM
+                                scaler.unscale_(optimizer)
+                                minimizer.ascent_step()
+                                
+                                # Descent step
+                                with autocast():
+                                    descent_predictions = model(inputs.float())
+                                    descent_loss = criterion(descent_predictions, targets)
+                                    descent_loss = descent_loss.mean() / grad_accumulation_steps
+                                
+                                scaler.scale(descent_loss).backward()
+                                scaler.unscale_(optimizer)
+                                minimizer.descent_step()
+                            else:
+                                # Standard optimizer step
+                                scaler.unscale_(optimizer)
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                                scaler.step(optimizer)
                             
                             # Update scaler
                             scaler.update()
+                            
+                            # Zero gradients after update
+                            optimizer.zero_grad()
                     else:
                         # Standard precision training
-                        # Ascent Step
+                        # Forward pass
                         predictions = model(inputs.float())
                         batch_loss = criterion(predictions, targets)
                         # Scale loss by accumulation steps
@@ -539,13 +646,23 @@ def main():
                         
                         # Only update weights after accumulating gradients
                         if (batch_idx + 1) % grad_accumulation_steps == 0 or (batch_idx + 1) == len(training_generator):
-                            minimizer.ascent_step()
+                            if use_asam:
+                                # ASAM optimizer steps
+                                minimizer.ascent_step()
+                                
+                                # Descent Step
+                                descent_predictions = model(inputs.float())
+                                descent_loss = criterion(descent_predictions, targets)
+                                descent_loss = descent_loss.mean() / grad_accumulation_steps
+                                descent_loss.backward()
+                                minimizer.descent_step()
+                            else:
+                                # Standard optimizer step
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                                optimizer.step()
                             
-                            # Descent Step
-                            descent_loss = criterion(model(inputs.float()), targets)
-                            descent_loss = descent_loss.mean() / grad_accumulation_steps
-                            descent_loss.backward()
-                            minimizer.descent_step()
+                            # Zero gradients after update
+                            optimizer.zero_grad()
 
                     # Calculate metrics on CPU to save GPU memory
                     with torch.no_grad():
@@ -652,14 +769,36 @@ def main():
                 epoch_loss_val.append(val_loss)
                 epoch_acc_val.append(val_accuracy)
                 
-                # Update learning rate based on validation accuracy
-                scheduler.step(val_accuracy)
+                # Update learning rate based on scheduler type
+                if use_plateau_scheduler:
+                    scheduler.step(val_accuracy)
+                else:
+                    # Use cosine annealing scheduler
+                    scheduler.step()
+                    
+                    # Check if we should switch to plateau scheduler
+                    if epoch > max_epochs // 2 and len(epoch_acc_val) > 3:
+                        # Check if validation accuracy is plateauing
+                        recent_accs = epoch_acc_val[-3:]
+                        if max(recent_accs) - min(recent_accs) < 0.5:  # Less than 0.5% change
+                            print("Validation accuracy plateauing. Switching to ReduceLROnPlateau scheduler.")
+                            use_plateau_scheduler = True
+                            plateau_scheduler.step(val_accuracy)
                 
-                # Save best model based on validation accuracy
-                if best_val_accuracy < val_accuracy:
-                    best_val_accuracy = val_accuracy
+                # Early stopping check
+                current_val_metric = val_accuracy
+                if current_val_metric > best_val_metric:
+                    best_val_metric = current_val_metric
+                    early_stopping_counter = 0
+                    # Save best model based on validation accuracy
                     torch.save(model.state_dict(), PATH + exp + '_best_val_ckpt.pt')
                     print(f"Saved new best model with validation accuracy: {val_accuracy:6.2f} %")
+                else:
+                    early_stopping_counter += 1
+                    print(f"Validation accuracy did not improve. Early stopping counter: {early_stopping_counter}/{early_stopping_patience}")
+                    if early_stopping_counter >= early_stopping_patience:
+                        print(f"Early stopping triggered after {epoch+1} epochs")
+                        break
             else:
                 print(f"Epoch: {epoch}, No valid validation batches processed")
                 epoch_loss_val.append(0)

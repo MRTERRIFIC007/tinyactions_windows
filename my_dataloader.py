@@ -6,6 +6,7 @@ import numpy as np
 import config as cfg
 import Preprocessing
 import os
+import random
 
 ############ Helper Functions ##############
 def resize(frames, size, interpolation='bilinear'):
@@ -43,20 +44,141 @@ class Normalize(object):
     def __call__(self, vid):
         return normalize(vid, self.mean, self.std)
 
+# Data augmentation transforms
+class RandomHorizontalFlip(object):
+    def __init__(self, p=0.5):
+        self.p = p
+        
+    def __call__(self, vid):
+        if random.random() < self.p:
+            return torch.flip(vid, [3])  # Flip width dimension
+        return vid
+
+class RandomColorJitter(object):
+    def __init__(self, brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05):
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.hue = hue
+        
+    def __call__(self, vid):
+        # Apply color jitter to each frame
+        # vid shape: C, T, H, W
+        C, T, H, W = vid.shape
+        
+        # Randomly adjust brightness, contrast, saturation, hue
+        brightness_factor = random.uniform(1-self.brightness, 1+self.brightness)
+        contrast_factor = random.uniform(1-self.contrast, 1+self.contrast)
+        saturation_factor = random.uniform(1-self.saturation, 1+self.saturation)
+        hue_factor = random.uniform(-self.hue, self.hue)
+        
+        # Apply to each frame
+        result = vid.clone()
+        for t in range(T):
+            frame = vid[:, t, :, :]  # C, H, W
+            
+            # Brightness
+            frame = frame * brightness_factor
+            
+            # Contrast
+            mean = torch.mean(frame, dim=[1, 2], keepdim=True)
+            frame = (frame - mean) * contrast_factor + mean
+            
+            # Clamp values to [0, 1]
+            frame = torch.clamp(frame, 0, 1)
+            
+            result[:, t, :, :] = frame
+            
+        return result
+
+class RandomCrop(object):
+    def __init__(self, size):
+        self.size = size
+        
+    def __call__(self, vid):
+        # vid shape: C, T, H, W
+        C, T, H, W = vid.shape
+        
+        # Calculate crop dimensions
+        new_h, new_w = self.size, self.size
+        
+        # Don't crop if the video is already smaller than the crop size
+        if H <= new_h or W <= new_w:
+            return vid
+            
+        # Random crop position
+        top = random.randint(0, H - new_h)
+        left = random.randint(0, W - new_w)
+        
+        # Crop the video
+        return vid[:, :, top:top+new_h, left:left+new_w]
+
+class RandomRotation(object):
+    def __init__(self, degrees=10):
+        self.degrees = degrees
+        
+    def __call__(self, vid):
+        # vid shape: C, T, H, W
+        C, T, H, W = vid.shape
+        
+        # Random rotation angle
+        angle = random.uniform(-self.degrees, self.degrees)
+        
+        # Apply rotation to each frame
+        result = torch.zeros_like(vid)
+        for t in range(T):
+            frame = vid[:, t, :, :]  # C, H, W
+            
+            # Convert to numpy for OpenCV
+            frame_np = frame.permute(1, 2, 0).numpy()  # H, W, C
+            
+            # Get rotation matrix
+            center = (W // 2, H // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            
+            # Apply rotation
+            rotated = cv2.warpAffine(frame_np, M, (W, H))
+            
+            # Convert back to tensor
+            result[:, t, :, :] = torch.from_numpy(rotated).permute(2, 0, 1)
+            
+        return result
 
 ################# TinyVIRAT Dataset ###################
 class TinyVIRAT_dataset(Dataset):
     'Characterizes a dataset for PyTorch'
-    def __init__(self, list_IDs, IDs_path, labels, num_frames=cfg.video_params['num_frames'], input_size=cfg.video_params['height'], frame_by_frame=False):
+    def __init__(self, list_IDs, IDs_path, labels, num_frames=cfg.video_params['num_frames'], input_size=cfg.video_params['height'], frame_by_frame=False, use_augmentation=True, is_training=True):
         "Initialization"
         self.labels = labels
         self.list_IDs = list_IDs
         self.IDs_path = IDs_path
         self.num_frames = num_frames
         self.input_size = input_size
+        self.frame_by_frame = frame_by_frame
+        self.is_training = is_training
+        self.use_augmentation = use_augmentation and is_training
+        
+        # Basic transforms
         self.resize = Resize((self.input_size, self.input_size))
         self.normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        self.transform = transforms.Compose([ToFloatTensorInZeroOne(), self.resize, self.normalize])
+        
+        # Create transform pipeline
+        if self.use_augmentation:
+            print("Using data augmentation for training")
+            self.transform = transforms.Compose([
+                ToFloatTensorInZeroOne(),
+                self.resize,
+                RandomHorizontalFlip(p=0.5),
+                RandomColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+                RandomRotation(degrees=10),
+                self.normalize
+            ])
+        else:
+            self.transform = transforms.Compose([
+                ToFloatTensorInZeroOne(),
+                self.resize,
+                self.normalize
+            ])
         
         # For single video scenario, load all frames
         if len(self.list_IDs) == 1:
@@ -66,7 +188,6 @@ class TinyVIRAT_dataset(Dataset):
             self.frame_index_map = None
         else:
             self.single_video_frames = None
-            self.frame_by_frame = frame_by_frame
             if self.frame_by_frame:
                 # Build a mapping from a global sample index to (video_id, frame_index)
                 self.frame_index_map = []
