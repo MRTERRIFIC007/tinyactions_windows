@@ -211,7 +211,7 @@ def main():
             'batch_size': batch_size,
             'shuffle': shuffle,
             'num_workers': 0,  # Set to 0 to avoid multiprocessing issues
-            'pin_memory': torch.cuda.is_available(),  # Enable pin_memory if CUDA is available
+            'pin_memory': False,  # Disable pin_memory by default to avoid errors
             'drop_last': False  # Process all samples
         }
         
@@ -242,6 +242,10 @@ def main():
     if device.type == 'cuda':
         params['pin_memory'] = True
         print("pin_memory enabled for DataLoader")
+    else:
+        # Ensure pin_memory is disabled for CPU
+        params['pin_memory'] = False
+        print("pin_memory disabled for CPU training")
 
     ############ Data Generators ############
     try:
@@ -625,9 +629,14 @@ def main():
         
         # Initialize ASAM minimizer
         try:
-            minimizer = ASAM(optimizer, model, rho=rho, eta=eta)
-            use_asam = True
-            print(f"Using ASAM optimizer with rho={rho}, eta={eta}")
+            if device.type == 'cuda':
+                minimizer = ASAM(optimizer, model, rho=rho, eta=eta)
+                use_asam = True
+                print(f"Using ASAM optimizer with rho={rho}, eta={eta}")
+            else:
+                # Skip ASAM for CPU training to avoid CUDA tensor errors
+                use_asam = False
+                print("ASAM optimizer disabled for CPU training to avoid CUDA tensor errors")
         except Exception as e:
             print(f"Error initializing ASAM: {e}. Using standard optimizer.")
             use_asam = False
@@ -726,7 +735,7 @@ def main():
                         torch.cuda.empty_cache()
                     
                     # Use gradient checkpointing to save memory if available
-                    if hasattr(model, 'set_grad_checkpointing'):
+                    if hasattr(model, 'set_grad_checkpointing') and device.type == 'cuda':
                         model.set_grad_checkpointing(True)
 
                     # Forward pass with mixed precision if available
@@ -779,7 +788,7 @@ def main():
                         
                         # Only update weights after accumulating gradients
                         if (batch_idx + 1) % grad_accumulation_steps == 0 or (batch_idx + 1) == len(training_generator):
-                            if use_asam:
+                            if use_asam and device.type == 'cuda':  # Only use ASAM with CUDA
                                 # ASAM optimizer steps
                                 minimizer.ascent_step()
                                 
