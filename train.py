@@ -14,6 +14,14 @@ import traceback
 import gc
 import time
 
+# Import for mixed precision training
+try:
+    from torch.cuda.amp import autocast, GradScaler
+    AMP_AVAILABLE = True
+except ImportError:
+    AMP_AVAILABLE = False
+    print("Automatic Mixed Precision not available")
+
 # Force garbage collection to free up memory
 gc.collect()
 if torch.cuda.is_available():
@@ -95,13 +103,48 @@ def main():
         # Training Parameters
         shuffle = True
         print("Creating params....")
-        params = {'batch_size': 2,
-                  'shuffle': shuffle,
-                  'num_workers': 0}  # Set to 0 to avoid multiprocessing issues
-
-        max_epochs = 3
+        
+        # Determine optimal batch size based on available resources
+        if torch.cuda.is_available():
+            try:
+                free_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                print(f"Total GPU memory: {free_memory:.2f} GB")
+                if free_memory > 8:
+                    batch_size = 8
+                elif free_memory > 4:
+                    batch_size = 4
+                elif free_memory > 2:
+                    batch_size = 2
+                else:
+                    batch_size = 1
+            except:
+                batch_size = 2  # Default if can't determine memory
+        else:
+            # For CPU, use a smaller batch size but with gradient accumulation
+            batch_size = 1
+        
+        # Set up gradient accumulation steps (process multiple batches before updating weights)
+        # This helps with small batch sizes
+        if batch_size < 4:
+            grad_accumulation_steps = 4 // batch_size
+            print(f"Using gradient accumulation with {grad_accumulation_steps} steps")
+        else:
+            grad_accumulation_steps = 1
+        
+        # Increase epochs for CPU training to compensate for smaller model
+        if not torch.cuda.is_available():
+            max_epochs = 10  # More epochs for CPU training
+        else:
+            max_epochs = 5  # Fewer epochs for GPU
+        
+        params = {
+            'batch_size': batch_size,
+            'shuffle': shuffle,
+            'num_workers': 0  # Set to 0 to avoid multiprocessing issues
+        }
+        
         inf_threshold = 0.6
-        print(params)
+        print(f"Training parameters: batch_size={batch_size}, grad_accumulation={grad_accumulation_steps}, epochs={max_epochs}")
     except Exception as e:
         print("Error during training parameter initialization:", str(e))
         traceback.print_exc()
@@ -110,33 +153,20 @@ def main():
     # Get the optimal device
     device = get_optimal_device()
     
-    # Adjust batch size based on available memory
+    # Set up mixed precision training if available
+    use_amp = AMP_AVAILABLE and device.type == 'cuda'
+    if use_amp:
+        print("Using Automatic Mixed Precision training")
+        scaler = GradScaler()
+    else:
+        print("Mixed precision not available, using full precision")
+    
+    # If using CUDA, enable pin_memory in DataLoader for faster data transfer
     if device.type == 'cuda':
-        try:
-            # Get available GPU memory in GB
-            free_memory = (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3
-            print(f"Available GPU memory: {free_memory:.2f} GB")
-            
-            # Adjust batch size based on available memory
-            if free_memory < 1.0:  # Less than 1GB
-                params['batch_size'] = 1
-                print(f"Limited GPU memory detected ({free_memory:.2f} GB). Reduced batch size to 1.")
-            elif free_memory < 2.0:  # Less than 2GB
-                params['batch_size'] = 2
-                print(f"Moderate GPU memory detected ({free_memory:.2f} GB). Using batch size of 2.")
-            else:  # More than 2GB
-                params['batch_size'] = 4
-                print(f"Sufficient GPU memory detected ({free_memory:.2f} GB). Increased batch size to 4.")
-        except Exception as e:
-            print(f"Error adjusting batch size: {e}")
-            # Keep default batch size
-        
-        # Enable pin_memory for faster data transfer to GPU
         params['pin_memory'] = True
         print("pin_memory enabled for DataLoader")
 
     ############ Data Generators ############
-    # CHANGE THIS PATH: Update the following path to the location of your training videos on your system
     try:
         video_root = cfg.file_paths['train_data']
         # Recursively collect video file paths and dummy labels from the folder
@@ -200,13 +230,48 @@ def main():
         # Create the dataset using TinyVIRAT_dataset
         train_dataset = TinyVIRAT_dataset(list_IDs=list_IDs, IDs_path=IDs_path, labels=labels, frame_by_frame=False)
         training_generator = DataLoader(train_dataset, **params)
+        
+        # Create a validation set (20% of training data)
+        if len(list_IDs) > 5:  # Only if we have enough data
+            val_size = max(1, int(len(list_IDs) * 0.2))
+            train_size = len(list_IDs) - val_size
+            
+            # Split the data
+            train_list_IDs = list_IDs[:train_size]
+            val_list_IDs = list_IDs[train_size:]
+            
+            # Create validation dataset and dataloader
+            val_dataset = TinyVIRAT_dataset(
+                list_IDs=[id for id in val_list_IDs], 
+                IDs_path=IDs_path, 
+                labels=labels, 
+                frame_by_frame=False
+            )
+            val_params = params.copy()
+            val_params['shuffle'] = False  # No need to shuffle validation data
+            val_generator = DataLoader(val_dataset, **val_params)
+            print(f"Created validation set with {len(val_list_IDs)} videos")
+            
+            # Update training dataset
+            train_dataset = TinyVIRAT_dataset(
+                list_IDs=[id for id in train_list_IDs], 
+                IDs_path=IDs_path, 
+                labels=labels, 
+                frame_by_frame=False
+            )
+            training_generator = DataLoader(train_dataset, **params)
+            print(f"Updated training set with {len(train_list_IDs)} videos")
+            
+            has_validation = True
+        else:
+            # Not enough data for validation, use training data for validation
+            val_generator = training_generator
+            has_validation = False
+            print("Not enough data for separate validation set, using training data for validation")
     except Exception as e:
         print("Error while creating data generator:", str(e))
         traceback.print_exc()
         return
-
-    # Optionally, you may want to also override the validation set or remove it entirely,
-    # depending on your experiment setup.
 
     try:
         # Choose model size based on available memory
@@ -266,15 +331,15 @@ def main():
                     mlp_ratio=4.
                 )
         else:
-            # For CPU, use the smallest model
-            print("Using CPU. Selecting tiny model for better performance.")
+            # For CPU, use the smallest model but with more width
+            print("Using CPU. Selecting optimized model for CPU training.")
             model = VideoSWIN3D(
                 num_classes=26,
                 patch_size=(2,4,4),
                 in_chans=3,
-                embed_dim=16,
+                embed_dim=24,  # Slightly larger than tiny model
                 depths=[1, 1, 1, 1],
-                num_heads=[1, 1, 1, 1],
+                num_heads=[2, 2, 2, 2],  # More heads for better representation
                 window_size=(8,7,7),
                 mlp_ratio=4.
             )
@@ -377,6 +442,11 @@ def main():
         else:
             optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wt_decay)
 
+        # Learning rate scheduler - reduce LR when plateauing
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=2, verbose=True
+        )
+        
         # ASAM with adjusted parameters for memory efficiency
         if device.type == 'cuda' and (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**3 < 1.0:
             # Use smaller rho for limited memory
@@ -396,8 +466,11 @@ def main():
     # Training and validation loops
     epoch_loss_train = []
     epoch_acc_train = []
+    epoch_loss_val = []
+    epoch_acc_val = []
 
     best_accuracy = 0.
+    best_val_accuracy = 0.
     print("Begin Training....")
     for epoch in range(max_epochs):
         try:
@@ -406,6 +479,7 @@ def main():
             loss = 0.
             accuracy = 0.
             cnt = 0.
+            batch_count = 0
 
             for batch_idx, (inputs, targets) in enumerate(tqdm(training_generator)):
                 try:
@@ -413,8 +487,9 @@ def main():
                     inputs = inputs.to(device)
                     targets = targets.to(device)
 
-                    # Clear gradients
-                    optimizer.zero_grad()
+                    # Only zero gradients at the beginning of accumulation steps
+                    if batch_idx % grad_accumulation_steps == 0:
+                        optimizer.zero_grad()
 
                     # Free up memory before forward pass
                     if device.type == 'cuda':
@@ -424,37 +499,73 @@ def main():
                     if hasattr(model, 'set_grad_checkpointing'):
                         model.set_grad_checkpointing(True)
 
-                    # Ascent Step
-                    predictions = model(inputs.float())
-                    batch_loss = criterion(predictions, targets)
-                    batch_loss.mean().backward()
-                    minimizer.ascent_step()
-
-                    # Free memory after backward pass
-                    if device.type == 'cuda':
-                        torch.cuda.empty_cache()
-
-                    # Descent Step
-                    descent_loss = criterion(model(inputs.float()), targets)
-                    descent_loss.mean().backward()
-                    minimizer.descent_step()
+                    # Forward pass with mixed precision if available
+                    if use_amp:
+                        with autocast():
+                            # Ascent Step
+                            predictions = model(inputs.float())
+                            batch_loss = criterion(predictions, targets)
+                            # Scale loss by accumulation steps
+                            batch_loss = batch_loss.mean() / grad_accumulation_steps
+                            
+                        # Backward pass with gradient scaling
+                        scaler.scale(batch_loss).backward()
+                        
+                        # Only update weights after accumulating gradients
+                        if (batch_idx + 1) % grad_accumulation_steps == 0 or (batch_idx + 1) == len(training_generator):
+                            # Ascent step
+                            scaler.unscale_(optimizer)
+                            minimizer.ascent_step()
+                            
+                            # Descent step
+                            with autocast():
+                                descent_loss = criterion(model(inputs.float()), targets)
+                                descent_loss = descent_loss.mean() / grad_accumulation_steps
+                            
+                            scaler.scale(descent_loss).backward()
+                            scaler.unscale_(optimizer)
+                            minimizer.descent_step()
+                            
+                            # Update scaler
+                            scaler.update()
+                    else:
+                        # Standard precision training
+                        # Ascent Step
+                        predictions = model(inputs.float())
+                        batch_loss = criterion(predictions, targets)
+                        # Scale loss by accumulation steps
+                        batch_loss = batch_loss.mean() / grad_accumulation_steps
+                        batch_loss.backward()
+                        
+                        # Only update weights after accumulating gradients
+                        if (batch_idx + 1) % grad_accumulation_steps == 0 or (batch_idx + 1) == len(training_generator):
+                            minimizer.ascent_step()
+                            
+                            # Descent Step
+                            descent_loss = criterion(model(inputs.float()), targets)
+                            descent_loss = descent_loss.mean() / grad_accumulation_steps
+                            descent_loss.backward()
+                            minimizer.descent_step()
 
                     # Calculate metrics on CPU to save GPU memory
                     with torch.no_grad():
-                        loss += batch_loss.sum().item()
+                        loss += batch_loss.sum().item() * grad_accumulation_steps
                         # Move predictions to CPU before computing accuracy
                         accuracy += compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
                     cnt += len(targets)
+                    batch_count += 1
                     
                     # Explicitly delete tensors to free memory
-                    del inputs, targets, predictions, batch_loss, descent_loss
+                    del inputs, targets, predictions, batch_loss
+                    if 'descent_loss' in locals():
+                        del descent_loss
                     if device.type == 'cuda':
                         torch.cuda.empty_cache()
                     
                     # Periodically run garbage collection
                     if batch_idx % 10 == 0:
                         gc.collect()
-                    
+                        
                 except RuntimeError as e:
                     if 'out of memory' in str(e):
                         print(f"CUDA out of memory encountered on batch {batch_idx} at epoch {epoch}. Clearing cache, collecting garbage, and printing memory summary.")
@@ -481,22 +592,91 @@ def main():
                     traceback.print_exc()
                     continue
 
-            loss /= cnt
-            accuracy /= (batch_idx + 1)
-            print(f"Epoch: {epoch}, Train accuracy: {accuracy:6.2f} %, Train loss: {loss:8.5f}")
-            epoch_loss_train.append(loss)
-            epoch_acc_train.append(accuracy)
+            # Calculate epoch metrics
+            if cnt > 0 and batch_count > 0:
+                loss /= cnt
+                accuracy /= batch_count
+                print(f"Epoch: {epoch}, Train accuracy: {accuracy:6.2f} %, Train loss: {loss:8.5f}")
+                epoch_loss_train.append(loss)
+                epoch_acc_train.append(accuracy)
+            else:
+                print(f"Epoch: {epoch}, No valid batches processed")
+                epoch_loss_train.append(0)
+                epoch_acc_train.append(0)
+
+            # Validation phase
+            model.eval()
+            val_loss = 0.
+            val_accuracy = 0.
+            val_cnt = 0.
+            val_batch_count = 0
+            
+            with torch.no_grad():
+                for val_batch_idx, (inputs, targets) in enumerate(tqdm(val_generator, desc="Validation")):
+                    try:
+                        # Move data to device
+                        inputs = inputs.to(device)
+                        targets = targets.to(device)
+                        
+                        # Forward pass with mixed precision if available
+                        if use_amp:
+                            with autocast():
+                                predictions = model(inputs.float())
+                                batch_loss = criterion(predictions, targets).sum().item()
+                        else:
+                            predictions = model(inputs.float())
+                            batch_loss = criterion(predictions, targets).sum().item()
+                        
+                        # Calculate accuracy
+                        batch_accuracy = compute_accuracy(predictions.detach().cpu(), targets.cpu(), inf_threshold)
+                        
+                        # Update counters
+                        val_loss += batch_loss
+                        val_accuracy += batch_accuracy
+                        val_cnt += len(targets)
+                        val_batch_count += 1
+                        
+                        # Free memory
+                        del inputs, targets, predictions
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                    except Exception as e:
+                        print(f"Error in validation batch {val_batch_idx}: {str(e)}")
+                        continue
+            
+            # Calculate validation metrics
+            if val_cnt > 0 and val_batch_count > 0:
+                val_loss /= val_cnt
+                val_accuracy /= val_batch_count
+                print(f"Epoch: {epoch}, Val accuracy: {val_accuracy:6.2f} %, Val loss: {val_loss:8.5f}")
+                epoch_loss_val.append(val_loss)
+                epoch_acc_val.append(val_accuracy)
+                
+                # Update learning rate based on validation accuracy
+                scheduler.step(val_accuracy)
+                
+                # Save best model based on validation accuracy
+                if best_val_accuracy < val_accuracy:
+                    best_val_accuracy = val_accuracy
+                    torch.save(model.state_dict(), PATH + exp + '_best_val_ckpt.pt')
+                    print(f"Saved new best model with validation accuracy: {val_accuracy:6.2f} %")
+            else:
+                print(f"Epoch: {epoch}, No valid validation batches processed")
+                epoch_loss_val.append(0)
+                epoch_acc_val.append(0)
 
             # Save best model based on training accuracy
             if best_accuracy < accuracy:
                 best_accuracy = accuracy
-                torch.save(model.state_dict(), PATH + exp + '_best_ckpt.pt')
+                torch.save(model.state_dict(), PATH + exp + '_best_train_ckpt.pt')
         except Exception as epoch_e:
             print(f"Error during epoch {epoch}: {str(epoch_e)}")
             traceback.print_exc()
             continue   # Skip the epoch and continue to the next one
 
     print(f"Best train accuracy: {best_accuracy}")
+    if has_validation:
+        print(f"Best validation accuracy: {best_val_accuracy}")
     print("TRAINING COMPLETED :)")
 
     # Testing phase on the entire training dataset
@@ -712,8 +892,8 @@ def main():
 
     try:
         # Save visualization
-        get_plot(PATH, epoch_acc_train, None, 'Accuracy-' + exp, 'Train Accuracy', 'Val Accuracy (N/A)', 'Epochs', 'Acc')
-        get_plot(PATH, epoch_loss_train, None, 'Loss-' + exp, 'Train Loss', 'Val Loss (N/A)', 'Epochs', 'Loss')
+        get_plot(PATH, epoch_acc_train, epoch_acc_val, 'Accuracy-' + exp, 'Train Accuracy', 'Val Accuracy', 'Epochs', 'Acc')
+        get_plot(PATH, epoch_loss_train, epoch_loss_val, 'Loss-' + exp, 'Train Loss', 'Val Loss', 'Epochs', 'Loss')
         print("Successfully saved visualization plots.")
     except Exception as e:
         print("Error while plotting:", str(e))

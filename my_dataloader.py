@@ -244,6 +244,12 @@ def get_video_data(root_path, num_classes=26):
     list_IDs = []
     IDs_path = {}
     labels = {}
+    
+    # Check if the directory exists
+    if not os.path.exists(root_path):
+        print(f"Warning: Directory {root_path} does not exist.")
+        return list_IDs, labels, IDs_path
+    
     for subdir, dirs, files in os.walk(root_path):
         for file in files:
             if file.endswith('.mp4'):
@@ -253,6 +259,7 @@ def get_video_data(root_path, num_classes=26):
                 list_IDs.append(video_id)
                 IDs_path[video_id] = full_path
                 labels[video_id] = [0] * num_classes
+    
     return list_IDs, labels, IDs_path
 
 if __name__ == '__main__':
