@@ -786,6 +786,31 @@ def main():
         print(f"Total training time: {(time.time() - start_time) / 60:.2f} minutes")
         print("="*50)
 
+        # Save all metrics to a summary file
+        metrics = {
+            "Total epochs": epoch + 1,
+            "Best training accuracy": best_accuracy,
+            "Final test accuracy": test_accuracy,
+            "Final test precision": test_precision,
+            "Final test recall": test_recall,
+            "Final test F1 score": test_f1,
+            "Final test loss": test_loss,
+            "Training completed": time.strftime('%Y-%m-%d %H:%M:%S'),
+            "Total training time (minutes)": (time.time() - start_time) / 60,
+            "Total samples": cnt,
+            "Total batches": successful_batches,
+            "Device": str(device),
+            "Batch size": params['batch_size'],
+            "Inference threshold": inf_threshold
+        }
+        
+        # Add validation metrics if available
+        if 'has_validation' in locals() and has_validation:
+            metrics["Best validation accuracy"] = best_val_accuracy
+        
+        # Save the metrics to a file
+        save_training_summary(PATH, exp, metrics)
+
     try:
         # Save visualization
         get_plot(PATH, epoch_acc_train, None, 'Accuracy-' + exp, 'Train Accuracy', 'Val Accuracy (N/A)', 'Epochs', 'Acc')
@@ -839,6 +864,36 @@ def main():
         print("Error while saving the trained model:", str(e))
         traceback.print_exc()
         print("WARNING: Model was not saved!")
+
+def save_training_summary(path, exp_name, metrics):
+    """Save a simple summary of training metrics to a text file"""
+    try:
+        summary_file = os.path.join(path, f"{exp_name}_training_summary.txt")
+        with open(summary_file, "w") as f:
+            f.write("="*50 + "\n")
+            f.write("TRAINING SUMMARY\n")
+            f.write("="*50 + "\n")
+            
+            # Write all metrics
+            for key, value in metrics.items():
+                if isinstance(value, float):
+                    if "accuracy" in key.lower() or "acc" in key.lower():
+                        # Format accuracies as percentages
+                        f.write(f"{key}: {value*100:.2f}%\n")
+                    else:
+                        # Format other metrics with 4 decimal places
+                        f.write(f"{key}: {value:.4f}\n")
+                else:
+                    # For non-float values
+                    f.write(f"{key}: {value}\n")
+            
+            f.write("="*50 + "\n")
+        print(f"Training summary saved to {summary_file}")
+        return True
+    except Exception as e:
+        print(f"Error saving training summary: {e}")
+        traceback.print_exc()
+        return False
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()
